@@ -16,6 +16,7 @@ members = [
         "deploy/zakura-watchdog",
         "crates/xtask",
         "crates/zakura-jsonl-trace",
+        "crates/privacy-admission-core",
 ]
 
 # Use the edition 2021 dependency resolver in the workspace, to match the crates
