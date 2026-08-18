@@ -4965,6 +4965,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "privacy-admission-core"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "humantime",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "proc-macro-crate"
 version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
