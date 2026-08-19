@@ -110,6 +110,40 @@ fn no_due_advances_clock_marker_without_consuming_batch() {
 }
 
 #[test]
+fn no_due_observation_rejects_a_later_clock_rollback_without_mutation() {
+    // Given: an admission that is not due at timestamp thirteen.
+    let clock = CountingClock::new(Timestamp(12));
+    let mut core = AdmissionCore::new(clock.clone(), policy());
+    core.admit(AdmissionId(7), AdmissionOrigin::PrivateGateway)
+        .expect("admission succeeds");
+    clock.set(Timestamp(13));
+    let before = core.snapshot();
+
+    // When: preparation observes no due admissions, then observes an earlier timestamp.
+    assert_eq!(core.prepare_release(), Ok(None));
+    clock.set(Timestamp(12));
+    let error = core.prepare_release().expect_err("rollback is rejected");
+
+    // Then: the no-due observation is the rollback marker, and failed release is atomic.
+    assert_eq!(
+        error,
+        AdmissionError::ClockRollback {
+            observed: Timestamp(12),
+            last_observed: Timestamp(13),
+        }
+    );
+    assert_eq!(core.snapshot(), before);
+    clock.set(Timestamp(20));
+    assert!(matches!(
+        core.release_due().expect("due release succeeds"),
+        ReleaseOutcome::Released {
+            batch_id: BatchId(0),
+            ..
+        }
+    ));
+}
+
+#[test]
 fn release_rollback_reads_once_and_leaves_state_unchanged() {
     // Given: an admission and a rolled-back clock.
     let clock = CountingClock::new(Timestamp(12));

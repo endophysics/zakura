@@ -20,6 +20,11 @@ impl<C: Clock> AdmissionCore<C> {
         &self.policy
     }
 
+    /// Return the number of admission records retained by the core.
+    pub fn record_count(&self) -> usize {
+        self.records.len()
+    }
+
     /// Return embargoed admission identifiers in ascending order.
     pub fn embargoed_ids(&self) -> Vec<AdmissionId> {
         self.records
@@ -46,6 +51,20 @@ impl<C: Clock> AdmissionCore<C> {
                 | AdmissionState::Removed(_) => None,
             })
             .collect()
+    }
+
+    /// Return the earliest scheduled release among nonterminal admissions.
+    pub fn earliest_release_at(&self) -> Option<Timestamp> {
+        self.records
+            .values()
+            .filter_map(|record| match &record.state {
+                AdmissionState::Embargoed(state) => Some(state.schedule.scheduled_release_at),
+                AdmissionState::Eligible(state) => Some(state.schedule.scheduled_release_at),
+                AdmissionState::Released(_)
+                | AdmissionState::Rejected(_)
+                | AdmissionState::Removed(_) => None,
+            })
+            .min()
     }
 
     /// Return an owned view of one admission.

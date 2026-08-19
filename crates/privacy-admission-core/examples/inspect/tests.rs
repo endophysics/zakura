@@ -100,6 +100,7 @@ fn scenario_emits_compact_plaintext_free_jsonl_contract() -> Result<(), ExampleE
             "advanced",
             "due",
             "eligible",
+            "prepared",
             "released",
             "snapshot",
         ]
@@ -115,8 +116,10 @@ fn scenario_emits_compact_plaintext_free_jsonl_contract() -> Result<(), ExampleE
     assert_eq!(events[9]["admission_ids"], serde_json::json!([1]));
     assert_eq!(events[10]["batch_id"], 0_u64);
     assert_eq!(events[10]["admission_ids"], serde_json::json!([1]));
+    assert_eq!(events[11]["batch_id"], 0_u64);
+    assert_eq!(events[11]["admission_ids"], serde_json::json!([1]));
     assert_eq!(
-        events[11]["snapshot"]
+        events[12]["snapshot"]
             .as_object()
             .map(|snapshot| snapshot.keys().cloned().collect::<BTreeSet<_>>()),
         Some(
@@ -125,14 +128,14 @@ fn scenario_emits_compact_plaintext_free_jsonl_contract() -> Result<(), ExampleE
                 .collect()
         )
     );
-    assert_eq!(events[11]["snapshot"]["schema_version"], 1_u64);
+    assert_eq!(events[12]["snapshot"]["schema_version"], 1_u64);
     assert_eq!(
-        events[11]["snapshot"]["admissions"][0]["admission_id"],
+        events[12]["snapshot"]["admissions"][0]["admission_id"],
         1_u64
     );
-    assert_eq!(events[11]["snapshot"]["admissions"][0]["batch_id"], 0_u64);
-    assert_eq!(events[11]["snapshot"]["admissions"][1]["state"], "rejected");
-    assert_eq!(events[11]["snapshot"]["admissions"][2]["state"], "removed");
+    assert_eq!(events[12]["snapshot"]["admissions"][0]["batch_id"], 0_u64);
+    assert_eq!(events[12]["snapshot"]["admissions"][1]["state"], "rejected");
+    assert_eq!(events[12]["snapshot"]["admissions"][2]["state"], "removed");
     Ok(())
 }
 

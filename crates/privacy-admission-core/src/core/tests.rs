@@ -42,3 +42,35 @@ fn batch_overflow_leaves_clock_marker_and_all_states_unchanged() {
     assert_eq!(core.snapshot(), before);
     assert_eq!(core.next_batch_id, u64::MAX);
 }
+
+#[test]
+fn batch_overflow_is_rejected_during_preparation_without_mutation() {
+    // Given: a due preparation with the next batch identifier exhausted.
+    let clock = TestClock(Rc::new(Cell::new(Timestamp(12))));
+    let policy = ReleasePolicy::new(
+        Duration::from_nanos(10),
+        Duration::from_nanos(5),
+        Duration::from_nanos(25),
+    );
+    assert!(policy.is_ok(), "test policy must be valid");
+    let Some(policy) = policy.ok() else {
+        return;
+    };
+    let mut core = AdmissionCore::new(clock.clone(), policy);
+    assert!(core
+        .admit(AdmissionId(7), AdmissionOrigin::PrivateGateway)
+        .is_ok());
+    clock.0.set(Timestamp(20));
+    core.next_batch_id = u64::MAX;
+
+    // When: preparing a release would overflow the next batch identifier.
+    let before = core.snapshot();
+    let marker = core.last_observed;
+    let result = core.prepare_release();
+
+    // Then: preparation rejects overflow without changing the marker, records, or batch.
+    assert_eq!(result, Err(AdmissionError::BatchIdExhausted));
+    assert_eq!(core.last_observed, marker);
+    assert_eq!(core.snapshot(), before);
+    assert_eq!(core.next_batch_id, u64::MAX);
+}

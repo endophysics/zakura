@@ -4,11 +4,13 @@ use thiserror::Error;
 
 use crate::{
     AdmissionId, AdmissionOrigin, AdmissionOutcome, AdmissionSchedule, AdmissionState,
-    AdmissionView, Clock, EligibleAdmission, EmbargoedAdmission, ReasonCode, RejectedAdmission,
-    ReleasePolicy, ReleasePolicyError, RemovedAdmission, Timestamp, TransitionOutcome,
+    AdmissionStateLabel, AdmissionView, Clock, EligibleAdmission, EmbargoedAdmission, ReasonCode,
+    RejectedAdmission, ReleasePolicy, ReleasePolicyError, RemovedAdmission, Timestamp,
+    TransitionOutcome,
 };
 
 mod access;
+mod discard;
 mod release;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,12 +56,23 @@ pub enum AdmissionError {
         /// Missing admission identifier.
         admission_id: AdmissionId,
     },
+    /// The requested operation cannot discard a terminal admission.
+    #[error("admission {admission_id:?} is terminal in state {state:?}")]
+    TerminalAdmission {
+        /// Terminal admission identifier.
+        admission_id: AdmissionId,
+        /// Terminal state that prevented compensation.
+        state: AdmissionStateLabel,
+    },
     /// Release scheduling overflowed.
     #[error(transparent)]
     Schedule(#[from] ReleasePolicyError),
     /// Advancing the release-batch identifier would overflow.
     #[error("release batch identifier exhausted")]
     BatchIdExhausted,
+    /// The prepared due set no longer matches current admission state.
+    #[error("prepared release is stale")]
+    StalePreparedRelease,
 }
 
 /// Synchronous owner of deterministic admission and release state.

@@ -85,6 +85,10 @@ enum Event {
     Eligible {
         admission_ids: Vec<AdmissionId>,
     },
+    Prepared {
+        batch_id: BatchId,
+        admission_ids: Vec<AdmissionId>,
+    },
     Released {
         batch_id: BatchId,
         admission_ids: Vec<AdmissionId>,
@@ -209,7 +213,17 @@ fn execute<W: Write>(cli: Cli, mut output: W) -> Result<(), ExampleError> {
             admission_ids: core.eligible_ids(),
         },
     )?;
-    match core.release_due()? {
+    let prepared = core
+        .prepare_release()?
+        .ok_or(ExampleError::ReleaseWasEmpty)?;
+    write_event(
+        &mut output,
+        Event::Prepared {
+            batch_id: prepared.batch_id(),
+            admission_ids: prepared.admission_ids().to_vec(),
+        },
+    )?;
+    match core.commit_release(prepared)? {
         ReleaseOutcome::NoDue => return Err(ExampleError::ReleaseWasEmpty),
         ReleaseOutcome::Released {
             batch_id,
