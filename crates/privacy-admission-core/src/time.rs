@@ -2,7 +2,33 @@
 mod tests {
     use std::time::Duration;
 
-    use crate::{Clock, ManualClock, ReleasePolicy, ReleasePolicyError, Timestamp};
+    use std::sync::Arc;
+
+    use crate::{Clock, ManualClock, MonotonicClock, ReleasePolicy, ReleasePolicyError, Timestamp};
+
+    #[test]
+    fn monotonic_clock_observations_never_decrease() {
+        // Given: a process-relative monotonic clock.
+        let clock = MonotonicClock::new();
+
+        // When: it is observed repeatedly.
+        let observations = (0..32).map(|_| clock.now()).collect::<Vec<_>>();
+
+        // Then: every observation is at least its predecessor.
+        assert!(observations.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn monotonic_clock_clone_shares_the_same_baseline() {
+        // Given: a process-relative monotonic clock.
+        let clock = MonotonicClock::new();
+
+        // When: the clock is cloned.
+        let cloned = clock.clone();
+
+        // Then: both clocks retain the exact same baseline allocation.
+        assert!(Arc::ptr_eq(&clock.baseline, &cloned.baseline));
+    }
 
     #[test]
     fn timestamp_converts_duration_and_rejects_unrepresentable_nanoseconds() {
@@ -58,6 +84,39 @@ mod tests {
     }
 
     #[test]
+    fn release_policy_rejects_unrepresentable_minimum_and_maximum() {
+        // Given: each release bound is oversized without making the bounds inverted.
+        let oversized_minimum = Duration::new(u64::MAX, 1);
+        let oversized_maximum = Duration::new(u64::MAX, 2);
+
+        // When: each oversized bound is validated independently.
+        let minimum_result = ReleasePolicy::new(
+            Duration::from_nanos(1),
+            oversized_minimum,
+            oversized_maximum,
+        );
+        let maximum_result = ReleasePolicy::new(
+            Duration::from_nanos(1),
+            Duration::from_nanos(1),
+            oversized_maximum,
+        );
+
+        // Then: the field-specific timestamp errors are returned.
+        assert_eq!(
+            minimum_result,
+            Err(ReleasePolicyError::MinimumOutOfRange(
+                crate::TimestampError::DurationOutOfRange
+            ))
+        );
+        assert_eq!(
+            maximum_result,
+            Err(ReleasePolicyError::MaximumOutOfRange(
+                crate::TimestampError::DurationOutOfRange
+            ))
+        );
+    }
+
+    #[test]
     fn release_policy_keeps_exact_epoch_and_caps_to_maximum_delay() {
         // Given: policies that exercise the epoch and maximum-delay paths.
         let exact_epoch = ReleasePolicy::new(
@@ -86,7 +145,10 @@ mod tests {
         assert_eq!(capped_release, Timestamp(28));
     }
 }
-use std::time::Duration;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -147,6 +209,42 @@ pub trait Clock {
     fn now(&self) -> Timestamp;
 }
 
+/// A cloneable clock measured from one shared process-relative baseline.
+#[derive(Clone, Debug)]
+pub struct MonotonicClock {
+    baseline: Arc<Instant>,
+}
+
+impl MonotonicClock {
+    /// Create a clock whose zero timestamp is the current monotonic instant.
+    pub fn new() -> Self {
+        Self {
+            baseline: Arc::new(Instant::now()),
+        }
+    }
+
+    /// Convert a timestamp from this clock into its monotonic instant.
+    pub fn instant_at(&self, timestamp: Timestamp) -> Option<Instant> {
+        self.baseline
+            .checked_add(Duration::from_nanos(timestamp.as_nanos()))
+    }
+}
+
+impl Default for MonotonicClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for MonotonicClock {
+    fn now(&self) -> Timestamp {
+        match u64::try_from(self.baseline.elapsed().as_nanos()) {
+            Ok(nanoseconds) => Timestamp(nanoseconds),
+            Err(_) => Timestamp(u64::MAX),
+        }
+    }
+}
+
 /// A deterministic clock controlled by its caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ManualClock {
@@ -196,6 +294,8 @@ impl ReleasePolicy {
         if epoch.0 == 0 {
             return Err(ReleasePolicyError::ZeroEpoch);
         }
+        Timestamp::from_duration(minimum).map_err(ReleasePolicyError::MinimumOutOfRange)?;
+        Timestamp::from_duration(maximum).map_err(ReleasePolicyError::MaximumOutOfRange)?;
         if minimum > maximum {
             return Err(ReleasePolicyError::MinimumExceedsMaximum);
         }
@@ -234,12 +334,28 @@ impl ReleasePolicy {
     }
 }
 
+impl Default for ReleasePolicy {
+    fn default() -> Self {
+        Self {
+            epoch: 60_000_000_000,
+            minimum: Duration::from_secs(5 * 60),
+            maximum: Duration::from_secs(10 * 60),
+        }
+    }
+}
+
 /// Errors from validating or evaluating a release policy.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum ReleasePolicyError {
     /// The epoch duration cannot be represented as nanoseconds.
     #[error("epoch duration exceeds the nanosecond timestamp range")]
     EpochOutOfRange(TimestampError),
+    /// The minimum release delay cannot be represented as nanoseconds.
+    #[error("minimum release delay exceeds the nanosecond timestamp range")]
+    MinimumOutOfRange(TimestampError),
+    /// The maximum release delay cannot be represented as nanoseconds.
+    #[error("maximum release delay exceeds the nanosecond timestamp range")]
+    MaximumOutOfRange(TimestampError),
     /// The epoch duration is zero.
     #[error("epoch duration must be non-zero")]
     ZeroEpoch,
