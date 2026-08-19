@@ -61,7 +61,7 @@ pub use primitives::{ed25519, groth16, halo2, redjubjub, redpallas, sapling::sap
 // Benchmarks only: hidden from the documentation, exported so a bench target can reach it.
 #[doc(hidden)]
 pub use primitives::clear_shielded_verification_caches;
-pub use router::RouterError;
+pub use router::{RouterError, VERIFIER_BUFFER_BOUND};
 
 /// A boxed [`std::error::Error`].
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;

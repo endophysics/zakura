@@ -58,7 +58,15 @@ mod tests;
 ///
 /// We deliberately add extra slots, because they only cost a small amount of
 /// memory, but missing slots can significantly slow down Zebra.
-const VERIFIER_BUFFER_BOUND: usize = 5;
+///
+/// Traffic classes that share the transaction verifier must leave at least one
+/// slot available for public traffic.
+pub const VERIFIER_BUFFER_BOUND: usize = 5;
+
+const _: () = assert!(
+    VERIFIER_BUFFER_BOUND > 1,
+    "the verifier buffer must reserve capacity for multiple users"
+);
 
 /// The block verifier router routes requests to either the checkpoint verifier or the
 /// semantic block verifier, depending on the maximum checkpoint height.
