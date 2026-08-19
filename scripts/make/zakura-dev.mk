@@ -1,4 +1,5 @@
 .PHONY: \
+	inspect-private-context \
 	zakura-build-dev \
 	zakura-dev-init \
 	zakura-start-dev
@@ -14,6 +15,9 @@ ifneq ($(filter command line environment override,$(origin ZAKURAD_BIN)),)
 ZAKURA_DEV_ZAKURAD_BIN := $(ZAKURAD_BIN)
 endif
 NETWORK ?= Mainnet
+
+inspect-private-context:
+	cargo test -p zakura --lib components::mempool::tests::vector::inspect_private_context --features privacy-admission -- --exact --nocapture
 
 zakura-build-dev:
 	cargo build --release --bin zakurad

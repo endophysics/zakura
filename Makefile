@@ -14,6 +14,7 @@ help:
 	@echo "  BRANCH=<branch> make install-branch   Install zakurad from a Git branch (default: main)"
 	@echo ""
 	@echo "  Dev Zakura (local node):"
+	@echo "  inspect-private-context        Run the private mempool context inspection test"
 	@echo "  zakura-build-dev                 Build release zakurad"
 	@echo "  zakura-dev-init                  Create ~/.local/zakura-dev config + dirs"
 	@echo "  zakura-start-dev                 Start local dev node (pruned, VCT, v2-only)"
