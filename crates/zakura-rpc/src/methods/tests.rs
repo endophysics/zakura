@@ -2,6 +2,7 @@
 
 #![allow(clippy::unwrap_in_result)]
 
+mod private_admission;
 mod prop;
 mod snapshot;
 pub mod utils;

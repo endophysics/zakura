@@ -148,6 +148,13 @@ where
     service.oneshot(request).await.map_misc_error()
 }
 
+fn deserialize_raw_transaction(raw_transaction_hex: &str) -> Result<Transaction> {
+    let raw_transaction_bytes =
+        Vec::from_hex(raw_transaction_hex).map_error(server::error::LegacyCode::Deserialization)?;
+    Transaction::zcash_deserialize(&*raw_transaction_bytes)
+        .map_error(server::error::LegacyCode::Deserialization)
+}
+
 include!(concat!(env!("OUT_DIR"), "/rpc_openrpc.rs"));
 
 // TODO: Review the parameter descriptions below, and update them as needed:
@@ -162,6 +169,9 @@ pub(super) const PARAM_LIMIT_DESC: &str = "The maximum number of subtrees to ret
 pub(super) const PARAM_REQUEST_DESC: &str = "The request object containing the parameters.";
 pub(super) const PARAM_INDEX_DESC: &str = "The index of the subtree to return.";
 pub(super) const PARAM_RAW_TRANSACTION_HEX_DESC: &str = "The hex-encoded raw transaction bytes.";
+#[cfg(feature = "privacy-admission")]
+pub(super) const PARAM_ADMISSION_ID_DESC: &str =
+    "The caller-supplied private admission identifier.";
 #[allow(non_upper_case_globals)]
 pub(super) const PARAM__ALLOW_HIGH_FEES_DESC: &str = "Whether to allow high fees.";
 pub(super) const PARAM_NUM_BLOCKS_DESC: &str = "The number of blocks to return.";
@@ -828,6 +838,23 @@ pub trait Rpc {
     ) -> Result<GetTxOutResponse>;
 }
 
+#[cfg(feature = "privacy-admission")]
+#[rpc(server)]
+/// Feature-gated private admission RPC method signatures.
+pub trait PrivateRpc {
+    /// Submits one raw transaction to the private admission pool.
+    #[method(name = "sendprivatetransaction")]
+    async fn send_private_transaction(
+        &self,
+        raw_transaction_hex: String,
+        admission_id: mempool::AdmissionId,
+    ) -> Result<mempool::PrivateAdmissionStatus>;
+
+    /// Returns aggregate-only diagnostics for the private pool.
+    #[method(name = "getprivatepoolinfo")]
+    async fn get_private_pool_info(&self) -> Result<mempool::PrivatePoolDiagnostics>;
+}
+
 /// RPC method implementations.
 #[derive(Clone)]
 pub struct RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
@@ -1307,10 +1334,7 @@ where
 
         // Reference for the legacy error code:
         // <https://github.com/zcash/zcash/blob/99ad6fdc3a549ab510422820eea5e5ce9f60a5fd/src/rpc/rawtransaction.cpp#L1259-L1260>
-        let raw_transaction_bytes = Vec::from_hex(raw_transaction_hex)
-            .map_error(server::error::LegacyCode::Deserialization)?;
-        let raw_transaction = Transaction::zcash_deserialize(&*raw_transaction_bytes)
-            .map_error(server::error::LegacyCode::Deserialization)?;
+        let raw_transaction = deserialize_raw_transaction(&raw_transaction_hex)?;
 
         let transaction_hash = raw_transaction.hash();
 
@@ -3316,6 +3340,70 @@ where
             }
             zakura_state::ReadResponse::Transaction(None) => Ok(GetTxOutResponse(None)),
             _ => unreachable!("unmatched response to a `Transaction` request"),
+        }
+    }
+}
+
+#[cfg(feature = "privacy-admission")]
+#[async_trait]
+impl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus> PrivateRpcServer
+    for RpcImpl<Mempool, State, ReadState, Tip, AddressBook, BlockVerifierRouter, SyncStatus>
+where
+    Mempool: MempoolService,
+    State: StateService,
+    ReadState: ReadStateService,
+    Tip: ChainTip + Clone + Send + Sync + 'static,
+    AddressBook: AddressBookPeers + Clone + Send + Sync + 'static,
+    BlockVerifierRouter: BlockVerifierService,
+    SyncStatus: ChainSyncStatus + Clone + Send + Sync + 'static,
+{
+    async fn send_private_transaction(
+        &self,
+        raw_transaction_hex: String,
+        admission_id: mempool::AdmissionId,
+    ) -> Result<mempool::PrivateAdmissionStatus> {
+        let transaction = deserialize_raw_transaction(&raw_transaction_hex)?;
+        let response = call_service(
+            self.mempool.clone(),
+            mempool::Request::QueuePrivate {
+                transaction: UnminedTx::from(transaction),
+                context: mempool::AdmissionContext {
+                    admission_id,
+                    policy: mempool::AdmissionPolicy::FixedEpoch,
+                },
+            },
+        )
+        .await?;
+
+        match response {
+            mempool::Response::PrivateQueued {
+                status: mempool::PrivateAdmissionStatus::Accepted,
+                completion: Some(completion),
+            } => {
+                completion
+                    .await
+                    .map_misc_error()?
+                    .map_error(server::error::LegacyCode::Verify)?;
+                Ok(mempool::PrivateAdmissionStatus::Accepted)
+            }
+            mempool::Response::PrivateQueued {
+                status: mempool::PrivateAdmissionStatus::Existing,
+                completion: None,
+            } => Ok(mempool::PrivateAdmissionStatus::Existing),
+            _ => unreachable!("incorrect response variant from mempool service"),
+        }
+    }
+
+    async fn get_private_pool_info(&self) -> Result<mempool::PrivatePoolDiagnostics> {
+        let response = call_service(
+            self.mempool.clone(),
+            mempool::Request::PrivatePoolDiagnostics,
+        )
+        .await?;
+
+        match response {
+            mempool::Response::PrivatePoolDiagnostics(diagnostics) => Ok(diagnostics),
+            _ => unreachable!("unexpected response to PrivatePoolDiagnostics request"),
         }
     }
 }
