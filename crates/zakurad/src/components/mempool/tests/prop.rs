@@ -9,9 +9,10 @@ use proptest_derive::Arbitrary;
 
 use chrono::Duration;
 use tokio::time;
-use tower::{buffer::Buffer, util::BoxService};
+use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
 
 use zakura_chain::{
+    amount::Amount,
     block::{self, Block},
     fmt::{DisplayToDebug, TypeNameToDebug},
     parameters::{Network, NetworkUpgrade},
@@ -20,13 +21,16 @@ use zakura_chain::{
 };
 use zakura_consensus::{error::TransactionError, transaction as tx};
 use zakura_network as zn;
+use zakura_node_services::mempool::Gossip;
+#[cfg(feature = "privacy-admission")]
+use zakura_node_services::mempool::{AdmissionContext, AdmissionId, AdmissionPolicy};
 use zakura_state::{self as zs, ChainTipBlock, ChainTipSender};
 use zakura_test::mock_service::{MockService, PropTestAssertion};
 use zs::CheckpointVerifiedBlock;
 
 use crate::components::{
     mempool::tests::standard_verified_unmined_tx_strategy,
-    mempool::{config::Config, Mempool},
+    mempool::{config::Config, Mempool, Request},
     sync::{RecentSyncLengths, SyncStatus},
 };
 
@@ -42,6 +46,150 @@ type MockTxVerifier = MockService<tx::Request, tx::Response, PropTestAssertion, 
 const CHAIN_LENGTH: usize = 5;
 
 const DEFAULT_MEMPOOL_PROPTEST_CASES: u32 = 8;
+
+#[tokio::test]
+async fn same_height_different_hash_completion_is_reverified() {
+    // Given: a transaction that completes verification against the current genesis tip.
+    let network = Network::Mainnet;
+    let transaction = network
+        .unmined_transactions_in_blocks(1..=1)
+        .next()
+        .expect("mainnet test vectors contain a transaction")
+        .transaction;
+    #[cfg(feature = "privacy-admission")]
+    let private_transaction = network
+        .unmined_transactions_in_blocks(1..=2)
+        .nth(1)
+        .expect("mainnet test vectors contain a second transaction")
+        .transaction;
+    let (
+        mut mempool,
+        _peer_set,
+        mut state_service,
+        mut tx_verifier,
+        mut recent_syncs,
+        mut chain_tip_sender,
+    ) = setup(&network);
+    let old_tip = genesis_chain_tip().expect("mainnet genesis block is valid");
+    mempool.enable(&mut recent_syncs).await;
+    mempool
+        .ready()
+        .await
+        .expect("mempool becomes ready")
+        .call(Request::Queue(vec![Gossip::Tx(transaction)]))
+        .await
+        .expect("transaction is queued");
+    let state_transaction = state_service
+        .expect_request_that(|request| matches!(request, zs::Request::Transaction(_)))
+        .await
+        .expect("transaction state request arrives");
+    state_transaction.respond(zs::Response::Transaction(None));
+    let state_tip = state_service
+        .expect_request(zs::Request::Tip)
+        .await
+        .expect("tip state request arrives");
+    state_tip.respond(zs::Response::Tip(Some((old_tip.height, old_tip.hash))));
+    let verifier = tx_verifier
+        .expect_request_that(|request| matches!(request, tx::Request::Mempool { .. }))
+        .await
+        .expect("verifier request arrives");
+    let transaction = verifier
+        .request()
+        .clone()
+        .mempool_transaction()
+        .expect("verifier receives a mempool transaction");
+    verifier.respond(tx::Response::from(
+        VerifiedUnminedTx::new(
+            transaction,
+            Amount::try_from(1_000_000).expect("valid test fee"),
+            0,
+            0,
+            Arc::new(Vec::new()),
+        )
+        .expect("mock verification succeeds"),
+    ));
+    #[cfg(feature = "privacy-admission")]
+    let (private_context, mut private_completion) = {
+        let context = AdmissionContext {
+            admission_id: AdmissionId(99),
+            policy: AdmissionPolicy::FixedEpoch,
+        };
+        let response = mempool
+            .ready()
+            .await
+            .expect("mempool remains ready")
+            .call(Request::QueuePrivate {
+                transaction: private_transaction,
+                context,
+            })
+            .await
+            .expect("private transaction is queued");
+        let state_transaction = state_service
+            .expect_request_that(|request| matches!(request, zs::Request::Transaction(_)))
+            .await
+            .expect("private transaction state request arrives");
+        state_transaction.respond(zs::Response::Transaction(None));
+        let state_tip = state_service
+            .expect_request(zs::Request::Tip)
+            .await
+            .expect("private tip state request arrives");
+        state_tip.respond(zs::Response::Tip(Some((old_tip.height, old_tip.hash))));
+        let verifier = tx_verifier
+            .expect_request_that(|request| matches!(request, tx::Request::Mempool { .. }))
+            .await
+            .expect("private verifier request arrives");
+        let transaction = verifier
+            .request()
+            .clone()
+            .mempool_transaction()
+            .expect("private verifier receives a mempool transaction");
+        verifier.respond(tx::Response::from(
+            VerifiedUnminedTx::new(
+                transaction,
+                Amount::try_from(1_000_000).expect("valid test fee"),
+                0,
+                0,
+                Arc::new(Vec::new()),
+            )
+            .expect("private mock verification succeeds"),
+        ));
+        let crate::components::mempool::Response::PrivateQueued {
+            completion: Some(completion),
+            ..
+        } = response
+        else {
+            panic!("new private queue returns a completion");
+        };
+        (context, completion)
+    };
+    tokio::task::yield_now().await;
+
+    // When: the canonical tip changes to another hash without changing height.
+    let mut fork_tip = old_tip.clone();
+    fork_tip.hash = block::Hash([42; 32]);
+    fork_tip.previous_block_hash = old_tip.hash;
+    chain_tip_sender.set_best_non_finalized_tip(fork_tip.clone());
+    // Isolate completion admission from the separate reset-and-requeue path.
+    mempool
+        .chain_tip_change
+        .mark_last_change_hash(fork_tip.hash);
+    mempool.dummy_call().await;
+
+    // Then: the stale completion is retried rather than inserted into public storage.
+    assert_eq!(mempool.storage().transaction_count(), 0);
+    assert_eq!(mempool.tx_downloads().in_flight(), 1);
+    #[cfg(feature = "privacy-admission")]
+    {
+        assert_eq!(mempool.private_tx_downloads().in_flight(), 1);
+        assert!(mempool
+            .private_record(private_context.admission_id)
+            .is_none());
+        assert!(matches!(
+            private_completion.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+}
 
 fn standard_verified_unmined_tx_display_strategy(
 ) -> BoxedStrategy<DisplayToDebug<VerifiedUnminedTx>> {

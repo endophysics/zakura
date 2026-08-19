@@ -59,7 +59,9 @@ use crate::components::{
     sync::{BLOCK_DOWNLOAD_TIMEOUT, BLOCK_VERIFY_TIMEOUT},
 };
 
-use super::{queue_source_log_label, storage::NonStandardTransactionError, MempoolError};
+use super::{
+    queue_source_log_label, storage::NonStandardTransactionError, MempoolError, VerificationTip,
+};
 mod pending;
 use pending::CancelDownloadAndVerify;
 pub(super) use pending::PendingTransaction;
@@ -195,6 +197,10 @@ where
     /// The maximum serialized size of a transaction accepted into the mempool.
     max_transaction_bytes: u64,
 
+    /// The maximum number of concurrent download and verification tasks.
+    #[cfg(feature = "privacy-admission")]
+    max_concurrency: usize,
+
     // Internal downloads state
     /// A list of pending transaction download and verify tasks.
     #[pin]
@@ -205,12 +211,12 @@ where
                     (
                         VerifiedUnminedTx,
                         Vec<transparent::OutPoint>,
-                        Option<Height>,
+                        VerificationTip,
                         Option<oneshot::Sender<Result<(), BoxError>>>,
                     ),
-                    Box<(TransactionDownloadVerifyError, UnminedTxId)>,
+                    Box<(TransactionDownloadVerifyError, UnminedTxId, AdmissionOrigin)>,
                 >,
-                (UnminedTxId, tokio::time::error::Elapsed),
+                (UnminedTxId, tokio::time::error::Elapsed, AdmissionOrigin),
             >,
         >,
     >,
@@ -240,13 +246,13 @@ where
             (
                 VerifiedUnminedTx,
                 Vec<transparent::OutPoint>,
-                Option<Height>,
+                VerificationTip,
                 Option<oneshot::Sender<Result<(), BoxError>>>,
                 AdmissionOrigin,
             ),
-            Box<(UnminedTxId, TransactionDownloadVerifyError)>,
+            Box<(UnminedTxId, TransactionDownloadVerifyError, AdmissionOrigin)>,
         >,
-        (UnminedTxId, tokio::time::error::Elapsed),
+        (UnminedTxId, tokio::time::error::Elapsed, AdmissionOrigin),
     >;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
@@ -287,15 +293,15 @@ where
                     )))));
                 }
                 Ok(Err(boxed_err)) => {
-                    let (e, hash) = *boxed_err;
+                    let (e, hash, origin) = *boxed_err;
                     if let Some(pending) = this.pending_transactions.remove(&hash) {
                         if let Some(source) = pending.peer_source().cloned() {
                             Self::release_peer_slot(this.pending_per_peer, source);
                         }
                     }
-                    return Poll::Ready(Some(Ok(Err(Box::new((hash, e))))));
+                    return Poll::Ready(Some(Ok(Err(Box::new((hash, e, origin))))));
                 }
-                Err((txid, elapsed)) => {
+                Err((txid, elapsed, origin)) => {
                     // Remove the cancel handle so the spawned task's queued `Gossip`
                     // doesn't stay resident in `pending_transactions` after a verification
                     // timeout. Without this, a peer that gets each transaction to
@@ -305,7 +311,7 @@ where
                             Self::release_peer_slot(this.pending_per_peer, source);
                         }
                     }
-                    return Poll::Ready(Some(Err((txid, elapsed))));
+                    return Poll::Ready(Some(Err((txid, elapsed, origin))));
                 }
             }
         }
@@ -349,9 +355,29 @@ where
             state,
             expose_peer_addresses,
             max_transaction_bytes,
+            #[cfg(feature = "privacy-admission")]
+            max_concurrency: MAX_INBOUND_CONCURRENCY,
             pending: FuturesUnordered::new(),
             pending_transactions: HashMap::new(),
             pending_per_peer: HashMap::new(),
+        }
+    }
+
+    /// Set an explicit concurrency capacity for this download stream.
+    #[cfg(feature = "privacy-admission")]
+    pub(super) fn with_capacity(mut self, max_concurrency: usize) -> Self {
+        self.max_concurrency = max_concurrency;
+        self
+    }
+
+    const fn max_concurrency(&self) -> usize {
+        #[cfg(feature = "privacy-admission")]
+        {
+            self.max_concurrency
+        }
+        #[cfg(not(feature = "privacy-admission"))]
+        {
+            MAX_INBOUND_CONCURRENCY
         }
     }
 
@@ -360,10 +386,6 @@ where
     /// Returns the action taken in response to the queue request.
     ///
     /// Peer origins are subject to [`MAX_INBOUND_CONCURRENCY_PER_PEER`].
-    #[instrument(
-        skip(self, request, rsp_tx),
-        fields(txid = %request.gossip.id(), source = tracing::field::Empty)
-    )]
     #[allow(clippy::unwrap_in_result)]
     pub(super) fn download_if_needed_and_verify(
         &mut self,
@@ -372,11 +394,19 @@ where
     ) -> Result<(), MempoolError> {
         let gossiped_tx = request.gossip.clone();
         let txid = gossiped_tx.id();
+        let is_private = request.is_private();
+        let verification_span = if is_private {
+            tracing::debug_span!("private transaction verification")
+        } else {
+            tracing::debug_span!("mempool transaction verification", txid = %txid)
+        };
         let source_label = request
             .peer_source()
             .map(|source| queue_source_log_label(source, self.expose_peer_addresses))
             .unwrap_or_else(|| "none".to_string());
-        tracing::Span::current().record("source", source_label.as_str());
+        if !is_private {
+            verification_span.record("source", source_label.as_str());
+        }
 
         if let Some(existing) = self.pending_transactions.get(&txid) {
             if existing.conflicts_with(&request) {
@@ -384,27 +414,32 @@ where
                 return Err(MempoolError::ConflictingPrivateAdmission);
             }
 
-            debug!(
-                ?txid,
-                queue_len = self.pending.len(),
-                ?MAX_INBOUND_CONCURRENCY,
-                "transaction id already queued for inbound download: ignored transaction"
-            );
-            metrics::gauge!("mempool.currently.queued.transactions",)
-                .set(self.pending.len() as f64);
+            let is_sensitive = is_private || existing.is_private();
+            if !is_sensitive {
+                debug!(
+                    ?txid,
+                    queue_len = self.pending.len(),
+                    max_inbound_concurrency = self.max_concurrency(),
+                    "transaction id already queued for inbound download: ignored transaction"
+                );
+                metrics::gauge!("mempool.currently.queued.transactions",)
+                    .set(self.pending.len() as f64);
+            }
 
             return Err(MempoolError::AlreadyQueued);
         }
 
-        if self.pending.len() >= MAX_INBOUND_CONCURRENCY {
-            debug!(
-                ?txid,
-                queue_len = self.pending.len(),
-                ?MAX_INBOUND_CONCURRENCY,
-                "too many transactions queued for inbound download: ignored transaction"
-            );
-            metrics::gauge!("mempool.currently.queued.transactions",)
-                .set(self.pending.len() as f64);
+        if self.pending.len() >= self.max_concurrency() {
+            if !is_private {
+                debug!(
+                    ?txid,
+                    queue_len = self.pending.len(),
+                    max_inbound_concurrency = self.max_concurrency(),
+                    "too many transactions queued for inbound download: ignored transaction"
+                );
+                metrics::gauge!("mempool.currently.queued.transactions",)
+                    .set(self.pending.len() as f64);
+            }
 
             return Err(MempoolError::FullQueue);
         }
@@ -438,6 +473,9 @@ where
             .peer_source()
             .and_then(misbehavior_addr_from_queue_source);
         let max_transaction_bytes = self.max_transaction_bytes;
+        let result_origin = request.origin.clone();
+        let cancel_origin = request.origin.clone();
+        let timeout_origin = request.origin.clone();
 
         let gossiped_tx_req = gossiped_tx.clone();
 
@@ -449,20 +487,24 @@ where
             // Don't download/verify if the transaction is already in the best chain.
             Self::transaction_in_best_chain(&mut state, txid).await?;
 
-            trace!(?txid, "transaction is not in best chain");
+            if !is_private {
+                trace!(?txid, "transaction is not in best chain");
+            }
 
-            let (tip_height, next_height) = match state.oneshot(zs::Request::Tip).await {
-                Ok(zs::Response::Tip(None)) => Ok((None, Height(0))),
-                Ok(zs::Response::Tip(Some((height, _hash)))) => {
+            let (verification_tip, next_height) = match state.oneshot(zs::Request::Tip).await {
+                Ok(zs::Response::Tip(None)) => Ok((VerificationTip::new(None), Height(0))),
+                Ok(zs::Response::Tip(Some((height, hash)))) => {
                     let next_height =
                         (height + 1).expect("valid heights are far below the maximum");
-                    Ok((Some(height), next_height))
+                    Ok((VerificationTip::new(Some((hash, height))), next_height))
                 }
                 Ok(_) => unreachable!("wrong response"),
                 Err(e) => Err(TransactionDownloadVerifyError::StateError(e.into())),
             }?;
 
-            trace!(?txid, ?next_height, "got next height");
+            if !is_private {
+                trace!(?txid, ?next_height, "got next height");
+            }
 
             let (tx, advertiser_addr) = match gossiped_tx {
                 Gossip::Id(txid) => {
@@ -506,15 +548,19 @@ where
                     (tx, advertiser_addr)
                 }
                 Gossip::Tx(tx) => {
-                    metrics::counter!(
-                        "mempool.pushed.transactions.total",
-                        "version" => format!("{}",tx.transaction().version()),
-                    ).increment(1);
+                    if !is_private {
+                        metrics::counter!(
+                            "mempool.pushed.transactions.total",
+                            "version" => format!("{}",tx.transaction().version()),
+                        ).increment(1);
+                    }
                     (tx, pushed_advertiser_addr)
                 }
             };
 
-            trace!(?txid, "got tx");
+            if !is_private {
+                trace!(?txid, "got tx");
+            }
 
             let result = verifier
                 .oneshot(tx::Request::Mempool {
@@ -526,31 +572,36 @@ where
                         panic!("unexpected non-mempool response to mempool request")
                     };
 
-                    (transaction, spent_mempool_outpoints, tip_height)
+                    (transaction, spent_mempool_outpoints, verification_tip)
                 })
                 .await;
 
             // Hide the transaction data to avoid filling the logs
-            trace!(?txid, result = ?result.as_ref().map(|_tx| ()), "verified transaction for the mempool");
+            if !is_private {
+                trace!(?txid, result = ?result.as_ref().map(|_tx| ()), "verified transaction for the mempool");
+            }
 
             result.map_err(|e| TransactionDownloadVerifyError::Invalid { error: e.into(), advertiser_addr } )
         }
-        .map_ok(|(tx, spent_mempool_outpoints, tip_height)| {
-            metrics::counter!(
-                "mempool.verified.transactions.total",
-                "version" => format!("{}", tx.transaction.transaction().version()),
-            ).increment(1);
-            (tx, spent_mempool_outpoints, tip_height)
+        .map_ok(move |(tx, spent_mempool_outpoints, verification_tip)| {
+            if !is_private {
+                metrics::counter!(
+                    "mempool.verified.transactions.total",
+                    "version" => format!("{}", tx.transaction.transaction().version()),
+                ).increment(1);
+            }
+            (tx, spent_mempool_outpoints, verification_tip)
         })
         // Tack the hash onto the error so we can remove the cancel handle
         // on failure as well as on success.
-        .map_err(move |e| Box::new((e, txid)))
+        .map_err(move |e| Box::new((e, txid, result_origin)))
         .inspect(move |result| {
-            // Hide the transaction data to avoid filling the logs
-            let result = result.as_ref().map(|_tx| txid);
-            debug!("mempool transaction result: {result:?}");
+            if !is_private {
+                let result = result.as_ref().map(|_tx| txid);
+                debug!("mempool transaction result: {result:?}");
+            }
         })
-        .in_current_span();
+        .instrument(verification_span);
 
         let task = tokio::spawn(async move {
             let fut = tokio::time::timeout(RATE_LIMIT_DELAY, fut);
@@ -560,12 +611,14 @@ where
                 biased;
                 _ = &mut cancel_rx => {
                     trace!("task cancelled prior to completion");
-                    metrics::counter!("mempool.cancelled.verify.tasks.total").increment(1);
+                    if !is_private {
+                        metrics::counter!("mempool.cancelled.verify.tasks.total").increment(1);
+                    }
                     if let Some(rsp_tx) = rsp_tx.take() {
                         let _ = rsp_tx.send(Err("verification cancelled".into()));
                     }
 
-                    Ok(Err(Box::new((TransactionDownloadVerifyError::Cancelled, txid))))
+                    Ok(Err(Box::new((TransactionDownloadVerifyError::Cancelled, txid, cancel_origin))))
                 }
                 verification = fut => {
                     verification
@@ -574,12 +627,12 @@ where
                                 let _ = rsp_tx.send(Err("timeout waiting for verification result".into()));
                             }
                         })
-                        .map_err(|elapsed| (txid, elapsed))
+                        .map_err(|elapsed| (txid, elapsed, timeout_origin))
                         .map(|inner_result| {
                             match inner_result {
-                                Ok((transaction, spent_mempool_outpoints, tip_height)) => Ok((transaction, spent_mempool_outpoints, tip_height, rsp_tx)),
+                                Ok((transaction, spent_mempool_outpoints, verification_tip)) => Ok((transaction, spent_mempool_outpoints, verification_tip, rsp_tx)),
                                 Err(boxed_err) => {
-                                    let (tx_verifier_error, tx_id) = *boxed_err;
+                                    let (tx_verifier_error, tx_id, origin) = *boxed_err;
                                     if let Some(rsp_tx) = rsp_tx.take() {
                                         let error_msg = format!(
                                             "failed to validate tx: {tx_id}, error: {tx_verifier_error}"
@@ -587,7 +640,7 @@ where
                                         let _ = rsp_tx.send(Err(error_msg.into()));
                                     };
 
-                                    Err(Box::new((tx_verifier_error, tx_id)))
+                                    Err(Box::new((tx_verifier_error, tx_id, origin)))
                                 }
                             }
                         })
@@ -610,14 +663,17 @@ where
             "transactions are only queued once"
         );
 
-        debug!(
-            ?txid,
-            queue_len = self.pending.len(),
-            ?MAX_INBOUND_CONCURRENCY,
-            "queued transaction hash for download"
-        );
-        metrics::gauge!("mempool.currently.queued.transactions",).set(self.pending.len() as f64);
-        metrics::counter!("mempool.queued.transactions.total").increment(1);
+        if !is_private {
+            debug!(
+                ?txid,
+                queue_len = self.pending.len(),
+                max_inbound_concurrency = self.max_concurrency(),
+                "queued transaction hash for download"
+            );
+            metrics::gauge!("mempool.currently.queued.transactions",)
+                .set(self.pending.len() as f64);
+            metrics::counter!("mempool.queued.transactions.total").increment(1);
+        }
 
         Ok(())
     }
@@ -801,6 +857,57 @@ mod tests {
             false,
             u64::MAX,
         )
+    }
+
+    #[tokio::test]
+    async fn completed_verification_preserves_tip_hash_and_height() {
+        // Given: state reports a concrete canonical tip before verification.
+        let transaction = empty_v5_transaction(7);
+        let tip = (zakura_chain::block::Hash([9; 32]), Height(42));
+        let mut downloads = Downloads::new(
+            BoxCloneService::new(service_fn(|_request| async move {
+                panic!("pushed transactions must not be downloaded");
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                let tx::Request::Mempool { transaction, .. } = request else {
+                    panic!("unexpected transaction verifier request: {request:?}");
+                };
+                let miner_fee = transaction.conventional_fee();
+                let transaction =
+                    VerifiedUnminedTx::new(transaction, miner_fee, 0, 0, Arc::new(Vec::new()))
+                        .expect("test transaction pays its conventional fee");
+                Ok::<_, BoxError>(tx::Response::Mempool {
+                    transaction,
+                    spent_mempool_outpoints: Vec::new(),
+                })
+            })),
+            BoxCloneService::new(service_fn(move |request| async move {
+                match request {
+                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
+                    zs::Request::Tip => Ok(zs::Response::Tip(Some((tip.1, tip.0)))),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            false,
+            u64::MAX,
+        );
+        downloads
+            .download_if_needed_and_verify(
+                PendingTransaction::new(Gossip::Tx(transaction), AdmissionOrigin::LegacyLocal),
+                None,
+            )
+            .expect("transaction is queued");
+
+        // When: the pushed transaction completes verification.
+        let completion = downloads
+            .next()
+            .await
+            .expect("download stream yields a completion")
+            .expect("verification does not time out")
+            .expect("verification succeeds");
+
+        // Then: the completion carries the exact state tip identity.
+        assert_eq!(completion.2.hash_and_height(), Some(tip));
     }
 
     #[cfg(feature = "privacy-admission")]

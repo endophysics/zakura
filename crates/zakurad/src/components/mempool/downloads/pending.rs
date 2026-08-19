@@ -41,12 +41,12 @@ impl PendingTransaction {
         Self::new(gossip.into(), origin)
     }
 
-    #[cfg(all(test, feature = "privacy-admission"))]
+    #[cfg(feature = "privacy-admission")]
     pub(in crate::components::mempool) fn gossip(&self) -> &Gossip {
         &self.gossip
     }
 
-    #[cfg(all(test, feature = "privacy-admission"))]
+    #[cfg(feature = "privacy-admission")]
     pub(in crate::components::mempool) fn origin(&self) -> &AdmissionOrigin {
         &self.origin
     }
@@ -78,6 +78,16 @@ impl PendingTransaction {
             AdmissionOrigin::Crawler | AdmissionOrigin::LegacyLocal => None,
             #[cfg(feature = "privacy-admission")]
             AdmissionOrigin::PrivateLocal(_) => None,
+        }
+    }
+
+    pub(in crate::components::mempool) fn is_private(&self) -> bool {
+        match self.origin {
+            AdmissionOrigin::Peer(_) | AdmissionOrigin::Crawler | AdmissionOrigin::LegacyLocal => {
+                false
+            }
+            #[cfg(feature = "privacy-admission")]
+            AdmissionOrigin::PrivateLocal(_) => true,
         }
     }
 }
