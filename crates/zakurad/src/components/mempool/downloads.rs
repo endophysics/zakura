@@ -51,7 +51,7 @@ use zakura_chain::{
 };
 use zakura_consensus::transaction as tx;
 use zakura_network::{self as zn, PeerSocketAddr};
-use zakura_node_services::mempool::{Gossip, QueueSource};
+use zakura_node_services::mempool::{AdmissionOrigin, Gossip, QueueSource};
 use zakura_state::{self as zs, CloneError};
 
 use crate::components::{
@@ -60,6 +60,9 @@ use crate::components::{
 };
 
 use super::{queue_source_log_label, storage::NonStandardTransactionError, MempoolError};
+mod pending;
+use pending::CancelDownloadAndVerify;
+pub(super) use pending::PendingTransaction;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -137,10 +140,6 @@ pub const MAX_INBOUND_CONCURRENCY: usize = 500;
 /// transactions have no source peer and are not counted against the cap.
 pub const MAX_INBOUND_CONCURRENCY_PER_PEER: usize = 5;
 
-/// A marker struct for the oneshot channels which cancel a pending download and verify.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-struct CancelDownloadAndVerify;
-
 /// Errors that can occur while downloading and verifying a transaction.
 #[derive(Error, Debug, Clone)]
 #[allow(dead_code)]
@@ -216,23 +215,13 @@ where
         >,
     >,
 
-    /// A list of channels that can be used to cancel pending transaction
-    /// download and verify tasks. Each entry also stores the corresponding
-    /// gossip request and the announcing peer (when known), so completion can
-    /// release the per-peer slot by `UnminedTxId` lookup.
-    cancel_handles: HashMap<
-        UnminedTxId,
-        (
-            oneshot::Sender<CancelDownloadAndVerify>,
-            Gossip,
-            Option<QueueSource>,
-        ),
-    >,
+    /// Pending transaction metadata and cancellation handles, keyed by transaction ID.
+    pending_transactions: HashMap<UnminedTxId, PendingTransaction>,
 
     /// The number of currently in-flight download tasks per advertising peer.
     ///
-    /// Invariant: a peer is present here iff some entry in [`Self::cancel_handles`]
-    /// has it as the third tuple element. Enforces
+    /// Invariant: a peer is present here iff a matching peer-origin entry exists in
+    /// [`Self::pending_transactions`]. Enforces
     /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`]. See `GHSA-4fc2-h7jh-287c`.
     pending_per_peer: HashMap<QueueSource, usize>,
 }
@@ -253,6 +242,7 @@ where
                 Vec<transparent::OutPoint>,
                 Option<Height>,
                 Option<oneshot::Sender<Result<(), BoxError>>>,
+                AdmissionOrigin,
             ),
             Box<(UnminedTxId, TransactionDownloadVerifyError)>,
         >,
@@ -260,7 +250,7 @@ where
     >;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let this = self.project();
+        let mut this = self.project();
         // CORRECTNESS
         //
         // The current task must be scheduled for wakeup every time we return
@@ -270,44 +260,55 @@ where
         // task is scheduled for wakeup when the next task becomes ready.
         //
         // TODO: this would be cleaner with poll_map (#2693)
-        let item = if let Some(join_result) = ready!(this.pending.poll_next(cx)) {
+        loop {
+            let Some(join_result) = ready!(this.pending.as_mut().poll_next(cx)) else {
+                return Poll::Ready(None);
+            };
             let result = join_result.expect("transaction download and verify tasks must not panic");
-            let (result, completed_txid) = match result {
+            match result {
                 Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))) => {
                     let hash = tx.transaction.id();
-                    (
-                        Ok(Ok((tx, spent_mempool_outpoints, tip_height, rsp_tx))),
-                        Some(hash),
-                    )
+                    let Some(pending) = this.pending_transactions.remove(&hash) else {
+                        if let Some(rsp_tx) = rsp_tx {
+                            let _ =
+                                rsp_tx.send(Err(TransactionDownloadVerifyError::Cancelled.into()));
+                        }
+                        continue;
+                    };
+                    if let Some(source) = pending.peer_source().cloned() {
+                        Self::release_peer_slot(this.pending_per_peer, source);
+                    }
+                    return Poll::Ready(Some(Ok(Ok((
+                        tx,
+                        spent_mempool_outpoints,
+                        tip_height,
+                        rsp_tx,
+                        pending.origin,
+                    )))));
                 }
                 Ok(Err(boxed_err)) => {
                     let (e, hash) = *boxed_err;
-                    (Ok(Err(Box::new((hash, e)))), Some(hash))
+                    if let Some(pending) = this.pending_transactions.remove(&hash) {
+                        if let Some(source) = pending.peer_source().cloned() {
+                            Self::release_peer_slot(this.pending_per_peer, source);
+                        }
+                    }
+                    return Poll::Ready(Some(Ok(Err(Box::new((hash, e))))));
                 }
                 Err((txid, elapsed)) => {
                     // Remove the cancel handle so the spawned task's queued `Gossip`
-                    // doesn't stay resident in `cancel_handles` after a verification
+                    // doesn't stay resident in `pending_transactions` after a verification
                     // timeout. Without this, a peer that gets each transaction to
                     // hit `RATE_LIMIT_DELAY` can leak ~2 MB per tx until OOM.
-                    if let Some((_, _gossip, Some(source))) = this.cancel_handles.remove(&txid) {
-                        Self::release_peer_slot(this.pending_per_peer, source);
+                    if let Some(pending) = this.pending_transactions.remove(&txid) {
+                        if let Some(source) = pending.peer_source().cloned() {
+                            Self::release_peer_slot(this.pending_per_peer, source);
+                        }
                     }
-                    (Err((txid, elapsed)), None)
-                }
-            };
-
-            if let Some(hash) = completed_txid {
-                if let Some((_, _gossip, Some(source))) = this.cancel_handles.remove(&hash) {
-                    Self::release_peer_slot(this.pending_per_peer, source);
+                    return Poll::Ready(Some(Err((txid, elapsed))));
                 }
             }
-
-            Some(result)
-        } else {
-            None
-        };
-
-        Poll::Ready(item)
+        }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -349,7 +350,7 @@ where
             expose_peer_addresses,
             max_transaction_bytes,
             pending: FuturesUnordered::new(),
-            cancel_handles: HashMap::new(),
+            pending_transactions: HashMap::new(),
             pending_per_peer: HashMap::new(),
         }
     }
@@ -358,28 +359,31 @@ where
     ///
     /// Returns the action taken in response to the queue request.
     ///
-    /// When `source` is `Some`, the per-peer cap
-    /// [`MAX_INBOUND_CONCURRENCY_PER_PEER`] is enforced; crawler-driven and
-    /// locally-pushed transactions pass `None` and are not capped per peer.
+    /// Peer origins are subject to [`MAX_INBOUND_CONCURRENCY_PER_PEER`].
     #[instrument(
-        skip(self, gossiped_tx, source, rsp_tx),
-        fields(txid = %gossiped_tx.id(), source = tracing::field::Empty)
+        skip(self, request, rsp_tx),
+        fields(txid = %request.gossip.id(), source = tracing::field::Empty)
     )]
     #[allow(clippy::unwrap_in_result)]
-    pub fn download_if_needed_and_verify(
+    pub(super) fn download_if_needed_and_verify(
         &mut self,
-        gossiped_tx: Gossip,
-        source: Option<QueueSource>,
+        mut request: PendingTransaction,
         mut rsp_tx: Option<oneshot::Sender<Result<(), BoxError>>>,
     ) -> Result<(), MempoolError> {
+        let gossiped_tx = request.gossip.clone();
         let txid = gossiped_tx.id();
-        let source_label = source
-            .as_ref()
+        let source_label = request
+            .peer_source()
             .map(|source| queue_source_log_label(source, self.expose_peer_addresses))
             .unwrap_or_else(|| "none".to_string());
         tracing::Span::current().record("source", source_label.as_str());
 
-        if self.cancel_handles.contains_key(&txid) {
+        if let Some(existing) = self.pending_transactions.get(&txid) {
+            if existing.conflicts_with(&request) {
+                #[cfg(feature = "privacy-admission")]
+                return Err(MempoolError::ConflictingPrivateAdmission);
+            }
+
             debug!(
                 ?txid,
                 queue_len = self.pending.len(),
@@ -407,7 +411,7 @@ where
 
         // Per-peer cap: a single advertising peer cannot saturate the queue
         // with attacker-supplied fake txids. See `GHSA-4fc2-h7jh-287c`.
-        if let Some(source) = &source {
+        if let Some(source) = request.peer_source() {
             let count = self.pending_per_peer.get(source).copied().unwrap_or(0);
             if count >= MAX_INBOUND_CONCURRENCY_PER_PEER {
                 debug!(
@@ -427,8 +431,12 @@ where
         let network = self.network.clone();
         let verifier = self.verifier.clone();
         let mut state = self.state.clone();
-        let download_source = source.as_ref().and_then(peer_source_from_queue_source);
-        let pushed_advertiser_addr = source.as_ref().and_then(misbehavior_addr_from_queue_source);
+        let download_source = request
+            .peer_source()
+            .and_then(peer_source_from_queue_source);
+        let pushed_advertiser_addr = request
+            .peer_source()
+            .and_then(misbehavior_addr_from_queue_source);
         let max_transaction_bytes = self.max_transaction_bytes;
 
         let gossiped_tx_req = gossiped_tx.clone();
@@ -590,15 +598,15 @@ where
         });
 
         self.pending.push(task);
-        if let Some(source) = &source {
+        if let Some(source) = request.peer_source() {
             // The per-peer cap check above ensures this can't exceed
             // `MAX_INBOUND_CONCURRENCY_PER_PEER`.
             *self.pending_per_peer.entry(source.clone()).or_insert(0) += 1;
         }
+        request.gossip = gossiped_tx_req;
+        request.cancel_sender = Some(cancel_tx);
         assert!(
-            self.cancel_handles
-                .insert(txid, (cancel_tx, gossiped_tx_req, source))
-                .is_none(),
+            self.pending_transactions.insert(txid, request).is_none(),
             "transactions are only queued once"
         );
 
@@ -620,16 +628,18 @@ where
         // TODO: this can be simplified with [`HashMap::drain_filter`] which
         // is currently nightly-only experimental API.
         let removed_txids: Vec<UnminedTxId> = self
-            .cancel_handles
+            .pending_transactions
             .keys()
             .filter(|txid| mined_ids.contains(&txid.mined_id()))
             .cloned()
             .collect();
 
         for txid in removed_txids {
-            if let Some((cancel_tx, _gossip, source)) = self.cancel_handles.remove(&txid) {
-                let _ = cancel_tx.send(CancelDownloadAndVerify);
-                if let Some(source) = source {
+            if let Some(mut pending) = self.pending_transactions.remove(&txid) {
+                if let Some(cancel_sender) = pending.cancel_sender.take() {
+                    let _ = cancel_sender.send(CancelDownloadAndVerify);
+                }
+                if let Some(source) = pending.peer_source().cloned() {
                     Self::release_peer_slot(&mut self.pending_per_peer, source);
                 }
             }
@@ -644,12 +654,14 @@ where
         // Signal cancellation to all running tasks.
         // Since we already dropped the JoinHandles above, they should
         // fail silently.
-        for (_hash, (cancel_tx, _gossip, _source)) in self.cancel_handles.drain() {
-            let _ = cancel_tx.send(CancelDownloadAndVerify);
+        for (_hash, mut pending) in self.pending_transactions.drain() {
+            if let Some(cancel_sender) = pending.cancel_sender.take() {
+                let _ = cancel_sender.send(CancelDownloadAndVerify);
+            }
         }
         self.pending_per_peer.clear();
         assert!(self.pending.is_empty());
-        assert!(self.cancel_handles.is_empty());
+        assert!(self.pending_transactions.is_empty());
         metrics::gauge!("mempool.currently.queued.transactions",).set(self.pending.len() as f64);
     }
 
@@ -671,10 +683,8 @@ where
     }
 
     /// Get a list of the currently pending transaction requests.
-    pub fn transaction_requests(&self) -> impl Iterator<Item = &Gossip> {
-        self.cancel_handles
-            .iter()
-            .map(|(_tx_id, (_handle, tx, _source))| tx)
+    pub(super) fn transaction_requests(&self) -> impl Iterator<Item = &PendingTransaction> {
+        self.pending_transactions.values()
     }
 
     /// Reject transactions that exceed the configured serialized size limit.
@@ -793,6 +803,136 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "privacy-admission")]
+    fn private_context(id: u64) -> zakura_node_services::mempool::AdmissionContext {
+        use zakura_node_services::mempool::{AdmissionContext, AdmissionId, AdmissionPolicy};
+
+        AdmissionContext {
+            admission_id: AdmissionId(id),
+            policy: AdmissionPolicy::FixedEpoch,
+        }
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    #[test]
+    fn retry_preserves_private_identity_and_downgrades_ordinary_origins() {
+        // Given: pending private, peer, crawler, and legacy-local records.
+        let context = private_context(7);
+        let records = [
+            PendingTransaction::new(Gossip::Id(tx_id(1)), AdmissionOrigin::PrivateLocal(context)),
+            PendingTransaction::new(
+                Gossip::Id(tx_id(2)),
+                AdmissionOrigin::Peer(QueueSource::Zakura(vec![2; 32])),
+            ),
+            PendingTransaction::new(Gossip::Id(tx_id(3)), AdmissionOrigin::Crawler),
+            PendingTransaction::new(Gossip::Id(tx_id(4)), AdmissionOrigin::LegacyLocal),
+        ];
+
+        // When: each record is converted into a retry.
+        let retry_origins: Vec<_> = records.iter().map(|record| record.retry().origin).collect();
+
+        // Then: only private identity survives and ordinary retries are local.
+        assert_eq!(
+            retry_origins,
+            vec![
+                AdmissionOrigin::PrivateLocal(context),
+                AdmissionOrigin::LegacyLocal,
+                AdmissionOrigin::LegacyLocal,
+                AdmissionOrigin::LegacyLocal,
+            ]
+        );
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    #[tokio::test]
+    async fn cancellation_drops_private_pending_context() {
+        // Given: a private transaction pending download.
+        let mut downloads = pending_downloads();
+        let transaction = empty_v5_transaction(7);
+        let tx_id = transaction.id();
+        downloads
+            .download_if_needed_and_verify(
+                PendingTransaction::new(
+                    Gossip::Tx(transaction),
+                    AdmissionOrigin::PrivateLocal(private_context(7)),
+                ),
+                None,
+            )
+            .expect("private transaction is queued");
+
+        // When: its mined ID cancels the pending task.
+        downloads.cancel(&HashSet::from([tx_id.mined_id()]));
+
+        // Then: no record remains to retain its context.
+        assert_eq!(downloads.transaction_requests().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn completed_transaction_cancelled_before_poll_is_not_returned() {
+        // Given: a pushed transaction whose successful task result is ready but unpolled.
+        let transaction = empty_v5_transaction(8);
+        let txid = transaction.id();
+        let source = QueueSource::LegacySocket(([127, 0, 0, 1], 8233).into());
+        let (rsp_tx, rsp_rx) = oneshot::channel();
+        let mut downloads = Downloads::new(
+            BoxCloneService::new(service_fn(|_request| async move {
+                panic!("pushed transactions must not be downloaded");
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                let tx::Request::Mempool { transaction, .. } = request else {
+                    panic!("unexpected transaction verifier request: {request:?}");
+                };
+                let miner_fee = transaction.conventional_fee();
+                let transaction =
+                    VerifiedUnminedTx::new(transaction, miner_fee, 0, 0, Arc::new(Vec::new()))
+                        .expect("test transaction pays its conventional fee");
+
+                Ok::<_, BoxError>(tx::Response::Mempool {
+                    transaction,
+                    spent_mempool_outpoints: Vec::new(),
+                })
+            })),
+            BoxCloneService::new(service_fn(|request| async move {
+                match request {
+                    zs::Request::Transaction(_) => Ok(zs::Response::Transaction(None)),
+                    zs::Request::Tip => Ok(zs::Response::Tip(None)),
+                    request => Err(format!("unexpected state request: {request:?}").into()),
+                }
+            })),
+            false,
+            u64::MAX,
+        );
+        downloads
+            .download_if_needed_and_verify(
+                PendingTransaction::new(Gossip::Tx(transaction), AdmissionOrigin::Peer(source)),
+                Some(rsp_tx),
+            )
+            .expect("transaction is queued");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while downloads.pending.iter().any(|task| !task.is_finished()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("verification task should complete without polling the stream");
+
+        // When: mined-tip cleanup cancels the transaction before its result is polled.
+        downloads.cancel(&HashSet::from([txid.mined_id()]));
+        let completion = downloads.next().await;
+
+        // Then: the stale success is discarded and its responder receives cancellation.
+        assert!(completion.is_none());
+        let responder_error = rsp_rx
+            .await
+            .expect("responder should receive cancellation")
+            .expect_err("responder must not receive success");
+        assert!(matches!(
+            responder_error.downcast_ref::<TransactionDownloadVerifyError>(),
+            Some(TransactionDownloadVerifyError::Cancelled)
+        ));
+        assert!(downloads.pending_per_peer.is_empty());
+    }
+
     #[tokio::test]
     async fn zakura_queue_source_is_counted_by_per_peer_cap() {
         let mut downloads = pending_downloads();
@@ -801,8 +941,10 @@ mod tests {
         for index in 0..MAX_INBOUND_CONCURRENCY_PER_PEER {
             downloads
                 .download_if_needed_and_verify(
-                    Gossip::Id(tx_id(u64::try_from(index).expect("test index fits u64"))),
-                    Some(zakura_source.clone()),
+                    PendingTransaction::new(
+                        Gossip::Id(tx_id(u64::try_from(index).expect("test index fits u64"))),
+                        AdmissionOrigin::Peer(zakura_source.clone()),
+                    ),
                     None,
                 )
                 .expect("within per-peer cap");
@@ -810,8 +952,10 @@ mod tests {
 
         assert!(matches!(
             downloads.download_if_needed_and_verify(
-                Gossip::Id(tx_id(100)),
-                Some(zakura_source.clone()),
+                PendingTransaction::new(
+                    Gossip::Id(tx_id(100)),
+                    AdmissionOrigin::Peer(zakura_source.clone()),
+                ),
                 None,
             ),
             Err(MempoolError::FullQueue)
@@ -819,15 +963,19 @@ mod tests {
 
         downloads
             .download_if_needed_and_verify(
-                Gossip::Id(tx_id(101)),
-                Some(QueueSource::Zakura(vec![8; 32])),
+                PendingTransaction::new(
+                    Gossip::Id(tx_id(101)),
+                    AdmissionOrigin::Peer(QueueSource::Zakura(vec![8; 32])),
+                ),
                 None,
             )
             .expect("different Zakura peer has a separate cap");
         downloads
             .download_if_needed_and_verify(
-                Gossip::Id(tx_id(102)),
-                Some(QueueSource::LegacySocket(([127, 0, 0, 1], 8233).into())),
+                PendingTransaction::new(
+                    Gossip::Id(tx_id(102)),
+                    AdmissionOrigin::Peer(QueueSource::LegacySocket(([127, 0, 0, 1], 8233).into())),
+                ),
                 None,
             )
             .expect("legacy socket has a separate cap");
@@ -863,8 +1011,10 @@ mod tests {
 
         downloads
             .download_if_needed_and_verify(
-                Gossip::Id(txid),
-                Some(QueueSource::Zakura(peer_id.clone())),
+                PendingTransaction::new(
+                    Gossip::Id(txid),
+                    AdmissionOrigin::Peer(QueueSource::Zakura(peer_id.clone())),
+                ),
                 None,
             )
             .expect("download is queued");
@@ -912,7 +1062,10 @@ mod tests {
         );
 
         downloads
-            .download_if_needed_and_verify(Gossip::Id(txid), None, None)
+            .download_if_needed_and_verify(
+                PendingTransaction::new(Gossip::Id(txid), AdmissionOrigin::LegacyLocal),
+                None,
+            )
             .expect("download is queued");
 
         let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
@@ -971,7 +1124,10 @@ mod tests {
         );
 
         downloads
-            .download_if_needed_and_verify(Gossip::Tx(transaction), None, None)
+            .download_if_needed_and_verify(
+                PendingTransaction::new(Gossip::Tx(transaction), AdmissionOrigin::LegacyLocal),
+                None,
+            )
             .expect("transaction at the configured limit is queued");
 
         let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
@@ -1025,10 +1181,12 @@ mod tests {
 
         downloads
             .download_if_needed_and_verify(
-                Gossip::Tx(transaction),
-                Some(QueueSource::LegacySocket(
-                    peer_addr.remove_socket_addr_privacy(),
-                )),
+                PendingTransaction::new(
+                    Gossip::Tx(transaction),
+                    AdmissionOrigin::Peer(QueueSource::LegacySocket(
+                        peer_addr.remove_socket_addr_privacy(),
+                    )),
+                ),
                 Some(rsp_tx),
             )
             .expect("oversized transaction policy check is queued");
@@ -1107,7 +1265,10 @@ mod tests {
         );
 
         downloads
-            .download_if_needed_and_verify(Gossip::Id(txid), None, None)
+            .download_if_needed_and_verify(
+                PendingTransaction::new(Gossip::Id(txid), AdmissionOrigin::LegacyLocal),
+                None,
+            )
             .expect("oversized advertised transaction is queued");
 
         let result = tokio::time::timeout(Duration::from_secs(1), downloads.next())
@@ -1164,10 +1325,12 @@ mod tests {
 
         downloads
             .download_if_needed_and_verify(
-                Gossip::Tx(transaction),
-                Some(QueueSource::LegacySocket(
-                    peer_addr.remove_socket_addr_privacy(),
-                )),
+                PendingTransaction::new(
+                    Gossip::Tx(transaction),
+                    AdmissionOrigin::Peer(QueueSource::LegacySocket(
+                        peer_addr.remove_socket_addr_privacy(),
+                    )),
+                ),
                 None,
             )
             .expect("download is queued");
