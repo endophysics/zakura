@@ -6,6 +6,9 @@ use std::{
     hash::Hash,
 };
 
+#[cfg(all(test, feature = "privacy-admission"))]
+use std::collections::VecDeque;
+
 use zakura_chain::{
     block::Height,
     ironwood, orchard, sapling, sprout,
@@ -34,7 +37,7 @@ use zakura_chain::transaction::MEMPOOL_TRANSACTION_COST_THRESHOLD;
 /// - the Sapling nullifiers revealed by transactions in the mempool
 /// - the Orchard nullifiers revealed by transactions in the mempool
 /// - the Ironwood nullifiers revealed by transactions in the mempool
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct VerifiedSet {
     /// The set of verified transactions in the mempool.
     transactions: HashMap<transaction::Hash, VerifiedUnminedTx>,
@@ -72,6 +75,11 @@ pub struct VerifiedSet {
 
     /// The set of revealed Ironwood nullifiers.
     ironwood_nullifiers: HashSet<ironwood::Nullifier>,
+
+    detached: bool,
+
+    #[cfg(all(test, feature = "privacy-admission"))]
+    eviction_order: VecDeque<transaction::Hash>,
 }
 
 impl Drop for VerifiedSet {
@@ -82,6 +90,33 @@ impl Drop for VerifiedSet {
 }
 
 impl VerifiedSet {
+    #[cfg(all(test, feature = "privacy-admission"))]
+    pub(super) fn set_eviction_order(
+        &mut self,
+        order: impl IntoIterator<Item = transaction::Hash>,
+    ) {
+        self.eviction_order = order.into_iter().collect();
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    pub(super) fn detached_clone(&self) -> Self {
+        let mut detached = self.clone();
+        detached.detached = true;
+        detached
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    pub(super) fn publish(mut self) -> Self {
+        self.detached = false;
+        self.report_metrics();
+        self
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    pub(super) fn silence_metrics(&mut self) {
+        self.detached = true;
+    }
+
     /// Returns a reference to the [`HashMap`] of [`VerifiedUnminedTx`]s in the set.
     pub fn transactions(&self) -> &HashMap<transaction::Hash, VerifiedUnminedTx> {
         &self.transactions
@@ -158,7 +193,7 @@ impl VerifiedSet {
         &mut self,
         mut transaction: VerifiedUnminedTx,
         spent_mempool_outpoints: Vec<transparent::OutPoint>,
-        pending_outputs: &mut PendingOutputs,
+        mut pending_outputs: Option<&mut PendingOutputs>,
         height: Option<Height>,
     ) -> Result<(), SameEffectsTipRejectionError> {
         if self.has_spend_conflicts(&transaction.transaction) {
@@ -183,7 +218,9 @@ impl VerifiedSet {
         for (index, output) in tx.outputs().iter().cloned().enumerate() {
             let outpoint = transparent::OutPoint::from_usize(tx_id, index);
             self.created_outputs.insert(outpoint, output.clone());
-            pending_outputs.respond(&outpoint, output)
+            if let Some(pending_outputs) = pending_outputs.as_deref_mut() {
+                pending_outputs.respond(&outpoint, output);
+            }
         }
         self.spent_outpoints.extend(tx.spent_outpoints());
         self.sprout_nullifiers.extend(tx.sprout_nullifiers());
@@ -227,6 +264,11 @@ impl VerifiedSet {
     /// [ZIP-401]: https://zips.z.cash/zip-0401
     #[allow(clippy::unwrap_in_result)]
     pub(super) fn evict_one(&mut self) -> Option<Vec<VerifiedUnminedTx>> {
+        #[cfg(all(test, feature = "privacy-admission"))]
+        if let Some(key_to_remove) = self.eviction_order.pop_front() {
+            return Some(self.remove(&key_to_remove));
+        }
+
         use rand::distributions::{Distribution, WeightedIndex};
         use rand::prelude::thread_rng;
 
@@ -382,6 +424,10 @@ impl VerifiedSet {
 
     /// Report the current mempool metrics.
     fn report_metrics(&self) {
+        if self.detached {
+            return;
+        }
+
         metrics::gauge!(
             "zcash.mempool.actions.unpaid",
             "bk" => "< 0.2",

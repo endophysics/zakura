@@ -4,6 +4,8 @@
 
 use std::{collections::HashSet, env, fmt::Debug, thread, time::Duration};
 
+#[cfg(feature = "privacy-admission")]
+use proptest::strategy::ValueTree as _;
 use proptest::{collection::vec, prelude::*};
 use proptest_derive::Arbitrary;
 
@@ -51,6 +53,16 @@ const MEMPOOL_TX_COUNT: usize = 4;
 ///
 /// A separate deterministic test checks the real production boundary.
 const TEST_REJECTION_LIST_CAPACITY: usize = 16;
+
+#[cfg(feature = "privacy-admission")]
+pub(super) fn conflicting_transactions_fixture() -> (VerifiedUnminedTx, VerifiedUnminedTx) {
+    let mut runner = proptest::test_runner::TestRunner::default();
+    any::<SpendConflictTestInput>()
+        .new_tree(&mut runner)
+        .expect("spend-conflict strategy creates a test fixture")
+        .current()
+        .conflicting_transactions()
+}
 
 fn rejection_id_with_index(mut template: UnminedTxId, index: u32) -> UnminedTxId {
     let index = index.to_le_bytes();

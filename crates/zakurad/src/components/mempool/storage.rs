@@ -21,6 +21,8 @@ use zakura_chain::{
     transaction::{self, Hash, Transaction, UnminedTx, UnminedTxId, VerifiedUnminedTx},
     transparent,
 };
+#[cfg(feature = "privacy-admission")]
+use zakura_node_services::mempool::AdmissionId;
 use zakura_node_services::mempool::TransactionDependencies;
 use zcash_script::solver;
 
@@ -38,6 +40,8 @@ pub mod tests;
 
 mod eviction_list;
 mod policy;
+#[cfg(feature = "privacy-admission")]
+mod private_batch;
 mod verified_set;
 
 /// The size limit for mempool transaction rejection lists per [ZIP-401].
@@ -171,6 +175,39 @@ pub struct RemovedTransactionIds {
     pub invalidated: HashSet<UnminedTxId>,
 }
 
+#[cfg(feature = "privacy-admission")]
+#[derive(Debug, Eq, PartialEq)]
+pub struct AtomicBatchEffects {
+    pub accepted: HashSet<UnminedTxId>,
+    pub evicted: HashSet<UnminedTxId>,
+}
+
+#[cfg(feature = "privacy-admission")]
+#[derive(Error, Eq, PartialEq)]
+pub enum AtomicBatchInsertError {
+    #[error("a private batch candidate was not accepted")]
+    Candidate {
+        admission_id: AdmissionId,
+        #[source]
+        source: MempoolError,
+    },
+    #[error("a private batch candidate was selected for eviction")]
+    BatchMemberEvicted { admission_ids: HashSet<AdmissionId> },
+    #[error("ZIP-401 eviction could not select a transaction")]
+    EvictionInvariant,
+}
+
+#[cfg(feature = "privacy-admission")]
+impl std::fmt::Debug for AtomicBatchInsertError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Candidate { .. } => formatter.write_str("Candidate(private)"),
+            Self::BatchMemberEvicted { .. } => formatter.write_str("BatchMemberEvicted(private)"),
+            Self::EvictionInvariant => formatter.write_str("EvictionInvariant"),
+        }
+    }
+}
+
 impl RemovedTransactionIds {
     /// Returns the total number of transactions that were removed from the mempool.
     pub fn total_len(&self) -> usize {
@@ -235,6 +272,16 @@ impl Drop for Storage {
 }
 
 impl Storage {
+    #[cfg(all(test, feature = "privacy-admission"))]
+    pub(crate) fn configure_private_promotion_eviction(
+        &mut self,
+        tx_cost_limit: u64,
+        eviction_order: impl IntoIterator<Item = transaction::Hash>,
+    ) {
+        self.tx_cost_limit = tx_cost_limit;
+        self.verified.set_eviction_order(eviction_order);
+    }
+
     #[allow(clippy::field_reassign_with_default)]
     pub(crate) fn new(config: &config::Config) -> Self {
         Self::new_with_rejection_list_capacity(config, MAX_EVICTION_MEMORY_ENTRIES)
@@ -280,7 +327,7 @@ impl Storage {
     /// Currently, we implement: per-transaction sigops limit, standard input script checks,
     /// input scriptSig size/push-only checks, standard output script checks (including OP_RETURN
     /// limits), and dust checks.
-    fn reject_if_non_standard_tx(&mut self, tx: &VerifiedUnminedTx) -> Result<(), MempoolError> {
+    fn check_standard_tx(&self, tx: &VerifiedUnminedTx) -> Result<(), NonStandardTransactionError> {
         use zcash_script::script::{self, Evaluable as _};
 
         let transaction = tx.transaction.transaction().as_ref();
@@ -294,35 +341,26 @@ impl Storage {
 
             // Rule: scriptSig size must be within the standard limit.
             if unlock_script.as_raw_bytes().len() > policy::MAX_STANDARD_SCRIPTSIG_SIZE {
-                return self
-                    .reject_non_standard(tx, NonStandardTransactionError::ScriptSigTooLarge);
+                return Err(NonStandardTransactionError::ScriptSigTooLarge);
             }
 
             let code = script::Code(unlock_script.as_raw_bytes().to_vec());
             // Rule: scriptSig must be push-only.
             if !code.is_push_only() {
-                return self
-                    .reject_non_standard(tx, NonStandardTransactionError::ScriptSigNotPushOnly);
+                return Err(NonStandardTransactionError::ScriptSigNotPushOnly);
             }
         }
 
         if !spent_outputs.is_empty() {
             // Validate that spent_outputs aligns with transparent inputs.
             if transaction.inputs().len() != spent_outputs.len() {
-                tracing::warn!(
-                    inputs = transaction.inputs().len(),
-                    spent_outputs = spent_outputs.len(),
-                    "spent_outputs length mismatch, rejecting as non-standard"
-                );
-                return self
-                    .reject_non_standard(tx, NonStandardTransactionError::NonStandardInputs);
+                return Err(NonStandardTransactionError::NonStandardInputs);
             }
 
             // Rule: all transparent inputs must pass `AreInputsStandard()` checks:
             // https://github.com/zcash/zcash/blob/v6.11.0/src/policy/policy.cpp#L137
             if !policy::are_inputs_standard(transaction, spent_outputs) {
-                return self
-                    .reject_non_standard(tx, NonStandardTransactionError::NonStandardInputs);
+                return Err(NonStandardTransactionError::NonStandardInputs);
             }
 
             // Rule: per-transaction sigops (legacy + P2SH) must not exceed the limit.
@@ -330,13 +368,13 @@ impl Storage {
             // https://github.com/zcash/zcash/blob/v6.11.0/src/main.cpp#L1819
             let total_sigops = tx.block_sigop_count();
             if total_sigops > policy::MAX_STANDARD_TX_SIGOPS {
-                return self.reject_non_standard(tx, NonStandardTransactionError::TooManySigops);
+                return Err(NonStandardTransactionError::TooManySigops);
             }
         } else {
             // No spent outputs available (e.g. shielded-only transaction).
             // Only check legacy sigops.
             if tx.legacy_sigop_count > policy::MAX_STANDARD_TX_SIGOPS {
-                return self.reject_non_standard(tx, NonStandardTransactionError::TooManySigops);
+                return Err(NonStandardTransactionError::TooManySigops);
             }
         }
 
@@ -351,19 +389,13 @@ impl Storage {
             match script_kind {
                 None => {
                     // Rule: output script must be standard (P2PKH/P2SH/P2PK/multisig/OP_RETURN).
-                    return self.reject_non_standard(
-                        tx,
-                        NonStandardTransactionError::ScriptPubKeyNonStandard,
-                    );
+                    return Err(NonStandardTransactionError::ScriptPubKeyNonStandard);
                 }
                 Some(solver::ScriptKind::NullData { .. }) => {
                     // Rule: OP_RETURN script size is limited.
                     // Cast is safe: u32 always fits in usize on 32-bit and 64-bit platforms.
                     if script_len > self.max_datacarrier_bytes as usize {
-                        return self.reject_non_standard(
-                            tx,
-                            NonStandardTransactionError::DataCarrierTooLarge,
-                        );
+                        return Err(NonStandardTransactionError::DataCarrierTooLarge);
                     }
                     // Rule: count OP_RETURN outputs to enforce the one-output limit.
                     data_out_count += 1;
@@ -374,18 +406,15 @@ impl Storage {
                     // rejection below, but we keep it to distinguish the two error reasons
                     // (ScriptPubKeyNonStandard for >3 keys vs BareMultiSig for valid multisig).
                     if pubkeys.len() > policy::MAX_STANDARD_MULTISIG_PUBKEYS {
-                        return self.reject_non_standard(
-                            tx,
-                            NonStandardTransactionError::ScriptPubKeyNonStandard,
-                        );
+                        return Err(NonStandardTransactionError::ScriptPubKeyNonStandard);
                     }
                     // Rule: bare multisig outputs are non-standard (fIsBareMultisigStd = false).
-                    return self.reject_non_standard(tx, NonStandardTransactionError::BareMultiSig);
+                    return Err(NonStandardTransactionError::BareMultiSig);
                 }
                 Some(_) => {
                     // Rule: non-OP_RETURN outputs must not be dust.
                     if output.is_dust() {
-                        return self.reject_non_standard(tx, NonStandardTransactionError::IsDust);
+                        return Err(NonStandardTransactionError::IsDust);
                     }
                 }
             }
@@ -393,7 +422,7 @@ impl Storage {
 
         // Rule: only one OP_RETURN output is permitted.
         if data_out_count > 1 {
-            return self.reject_non_standard(tx, NonStandardTransactionError::MultiOpReturn);
+            return Err(NonStandardTransactionError::MultiOpReturn);
         }
 
         Ok(())
@@ -409,9 +438,9 @@ impl Storage {
         &mut self,
         tx: &VerifiedUnminedTx,
         rejection_error: NonStandardTransactionError,
-    ) -> Result<(), MempoolError> {
+    ) -> MempoolError {
         self.reject(tx.transaction.id(), rejection_error.clone().into());
-        Err(MempoolError::NonStandardTransaction(rejection_error))
+        MempoolError::NonStandardTransaction(rejection_error)
     }
 
     /// Insert a [`VerifiedUnminedTx`] into the mempool, caching any rejections.
@@ -482,8 +511,19 @@ impl Storage {
         }
 
         // Check that the transaction is standard.
-        if let Err(error) = self.reject_if_non_standard_tx(&tx) {
-            return (Err(error), HashSet::new());
+        if let Err(error) = self.check_standard_tx(&tx) {
+            let transaction = tx.transaction.transaction();
+            if error == NonStandardTransactionError::NonStandardInputs
+                && !tx.spent_outputs.is_empty()
+                && transaction.inputs().len() != tx.spent_outputs.len()
+            {
+                tracing::warn!(
+                    inputs = transaction.inputs().len(),
+                    spent_outputs = tx.spent_outputs.len(),
+                    "spent_outputs length mismatch, rejecting as non-standard"
+                );
+            }
+            return (Err(self.reject_non_standard(&tx, error)), HashSet::new());
         }
 
         // Then, we try to insert into the pool. If this fails the transaction is rejected.
@@ -492,7 +532,7 @@ impl Storage {
         if let Err(rejection_error) = self.verified.insert(
             tx,
             spent_mempool_outpoints,
-            &mut self.pending_outputs,
+            Some(&mut self.pending_outputs),
             height,
         ) {
             tracing::debug!(
