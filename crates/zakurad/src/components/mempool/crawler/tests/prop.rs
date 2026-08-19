@@ -362,7 +362,7 @@ async fn respond_to_queue_request(
 
     mempool
         .expect_request_that(|req| {
-            if let mempool::Request::Queue(req) = req {
+            if let mempool::Request::QueueFromCrawler(req) = req {
                 let ids: HashSet<UnminedTxId> = req
                     .iter()
                     .filter_map(|gossip| {
@@ -396,7 +396,7 @@ async fn respond_to_queue_request_with_error(
 ) -> Result<(), TestCaseError> {
     mempool
         .expect_request_that(|req| {
-            if let mempool::Request::Queue(req) = req {
+            if let mempool::Request::QueueFromCrawler(req) = req {
                 let ids: HashSet<UnminedTxId> = req
                     .iter()
                     .filter_map(|gossip| {
