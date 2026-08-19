@@ -15,9 +15,16 @@ use crate::BoxError;
 
 mod gossip;
 mod mempool_change;
+#[cfg(feature = "privacy-admission")]
+mod private;
 mod service_trait;
 mod transaction_dependencies;
 
+#[cfg(feature = "privacy-admission")]
+pub use self::private::{
+    AdmissionContext, AdmissionId, AdmissionPolicy, PrivateAdmissionStatus, PrivatePoolDiagnostics,
+    PrivatePromotionOutcome, SchedulerState,
+};
 pub use self::{
     gossip::Gossip,
     mempool_change::{MempoolChange, MempoolChangeKind, MempoolTxSubscriber},
@@ -42,7 +49,12 @@ mod tests {
     use super::MempoolDisabledError;
 
     #[cfg(feature = "privacy-admission")]
-    use super::{AdmissionContext, AdmissionId, AdmissionOrigin, AdmissionPolicy, Request};
+    use super::{
+        AdmissionContext, AdmissionId, AdmissionOrigin, AdmissionPolicy, PrivateAdmissionStatus,
+        PrivatePromotionOutcome, Request, Response,
+    };
+    #[cfg(all(feature = "privacy-admission", feature = "rpc-client"))]
+    use super::{PrivatePoolDiagnostics, SchedulerState};
     #[cfg(feature = "privacy-admission")]
     use zakura_chain::transaction::UnminedTx;
 
@@ -74,6 +86,113 @@ mod tests {
         assert!(matches!(
             AdmissionOrigin::PrivateLocal(context),
             AdmissionOrigin::PrivateLocal(actual) if actual == context
+        ));
+
+        // Then: private admission and diagnostics have dedicated typed service shapes.
+        let _: Request = Request::PrivatePoolDiagnostics;
+        let _: fn(PrivateAdmissionStatus) -> Response = |status| Response::PrivateQueued {
+            status,
+            completion: None,
+        };
+    }
+
+    #[cfg(all(feature = "privacy-admission", feature = "rpc-client"))]
+    #[test]
+    fn private_aggregate_contracts_serialize_without_private_identity_or_timing() {
+        // Given: sentinel aggregate values and an accepted admission result.
+        let status = PrivateAdmissionStatus::Accepted;
+        let diagnostics = PrivatePoolDiagnostics {
+            transaction_count: 3,
+            serialized_bytes: 4096,
+            max_transactions: 10,
+            max_serialized_bytes: 8192,
+            embargoed_count: 1,
+            eligible_count: 1,
+            releasing_count: 1,
+            scheduler_state: SchedulerState::Idle,
+            promoted_count: 7,
+            recoverable_count: 2,
+            terminal_count: 1,
+        };
+        let outcome = PrivatePromotionOutcome::Promoted { count: 3 };
+
+        // When: the contracts are serialized and debug-formatted.
+        let scheduler_states = [
+            SchedulerState::Idle,
+            SchedulerState::Running,
+            SchedulerState::Stopping,
+            SchedulerState::Stalled,
+        ];
+        let serialized = serde_json::to_string(&(status, diagnostics, outcome, scheduler_states))
+            .expect("aggregate contracts serialize");
+        let debug = format!("{status:?} {diagnostics:?} {outcome:?}");
+
+        // Then: only aggregate, non-sensitive fields are exposed.
+        for forbidden in [
+            "transaction_id",
+            "admission_id",
+            "hash",
+            "plaintext",
+            "bytes_data",
+            "accepted_at",
+            "scheduled_release_at",
+            "terminal_at",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "serialized field: {forbidden}"
+            );
+            assert!(!debug.contains(forbidden), "debug field: {forbidden}");
+        }
+        assert!(serialized.contains("transaction_count"));
+        assert!(serialized.contains("serialized_bytes"));
+        assert!(serialized.contains("\"scheduler_state\":\"idle\""));
+        assert!(serialized.contains("\"running\""));
+        assert!(serialized.contains("\"stopping\""));
+        assert!(serialized.contains("\"stalled\""));
+        assert!(serialized.contains("promoted_count"));
+        assert!(serialized.contains("recoverable_count"));
+        assert!(serialized.contains("terminal_count"));
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    #[test]
+    fn private_promotion_outcomes_are_aggregate_only() {
+        // Given: each internal promotion outcome shape.
+        let outcomes = [
+            PrivatePromotionOutcome::NoDue,
+            PrivatePromotionOutcome::Promoted { count: 2 },
+            PrivatePromotionOutcome::Recoverable { count: 1 },
+            PrivatePromotionOutcome::Terminal { count: 4 },
+        ];
+
+        // When: outcomes are debug-formatted.
+        let debug = outcomes
+            .iter()
+            .map(|outcome| format!("{outcome:?}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Then: no outcome can carry a per-admission value.
+        for forbidden in ["transaction", "admission", "hash", "plaintext", "timestamp"] {
+            assert!(!debug.contains(forbidden), "debug field: {forbidden}");
+        }
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    #[test]
+    fn private_promotion_has_a_dedicated_service_contract() {
+        // Given: the internal synchronous promotion request.
+        let request = Request::PromotePrivateDue;
+
+        // When: a successful aggregate outcome is assigned to its response shape.
+        let response = Response::PrivatePromoted(PrivatePromotionOutcome::Promoted { count: 2 });
+
+        // Then: request and response remain distinct from public queue admission.
+        assert!(matches!(request, Request::PromotePrivateDue));
+        assert!(matches!(
+            response,
+            Response::PrivatePromoted(PrivatePromotionOutcome::Promoted { count: 2 })
         ));
     }
 }
@@ -112,28 +231,6 @@ pub enum AdmissionOrigin {
     /// A request submitted through the feature-gated private local path.
     #[cfg(feature = "privacy-admission")]
     PrivateLocal(AdmissionContext),
-}
-
-/// A stable private-admission identifier.
-#[cfg(feature = "privacy-admission")]
-pub use privacy_admission_core::AdmissionId;
-
-/// The scheduling policy for a private admission.
-#[cfg(feature = "privacy-admission")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AdmissionPolicy {
-    /// Admit according to a fixed release epoch.
-    FixedEpoch,
-}
-
-/// The private-admission metadata attached to a local transaction submission.
-#[cfg(feature = "privacy-admission")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AdmissionContext {
-    /// The stable private-admission identifier.
-    pub admission_id: AdmissionId,
-    /// The scheduling policy selected for this admission.
-    pub policy: AdmissionPolicy,
 }
 
 /// A mempool service request.
@@ -227,6 +324,14 @@ pub enum Request {
         context: AdmissionContext,
     },
 
+    /// Query aggregate-only private-pool diagnostics.
+    #[cfg(feature = "privacy-admission")]
+    PrivatePoolDiagnostics,
+
+    /// Synchronously promote the complete private batch that is currently due.
+    #[cfg(feature = "privacy-admission")]
+    PromotePrivateDue,
+
     /// Check for newly verified transactions.
     ///
     /// The transaction downloader does not push transactions into the mempool.
@@ -307,6 +412,23 @@ pub enum Response {
     ///
     /// Each result matches the request at the corresponding vector index.
     Queued(Vec<Result<oneshot::Receiver<Result<(), BoxError>>, BoxError>>),
+
+    /// Reports private admission status and optional verification completion.
+    #[cfg(feature = "privacy-admission")]
+    PrivateQueued {
+        /// Whether this request created a reservation or already existed.
+        status: PrivateAdmissionStatus,
+        /// Completion for a newly accepted reservation; absent for an exact retry.
+        completion: Option<oneshot::Receiver<Result<(), BoxError>>>,
+    },
+
+    /// Aggregate-only private-pool diagnostics.
+    #[cfg(feature = "privacy-admission")]
+    PrivatePoolDiagnostics(PrivatePoolDiagnostics),
+
+    /// Aggregate result of a synchronous private promotion attempt.
+    #[cfg(feature = "privacy-admission")]
+    PrivatePromoted(PrivatePromotionOutcome),
 
     /// Confirms that the mempool has checked for recently verified transactions.
     CheckedForVerifiedTransactions,
