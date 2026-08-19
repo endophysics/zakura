@@ -33,6 +33,8 @@ indexer = ["zakura-state/indexer"]
 # Experimental internal miner support
 internal-miner = []
 
+privacy-admission = ["zakura-node-services/privacy-admission"]
+
 # Test-only features
 proptest-impl = [
     "proptest",

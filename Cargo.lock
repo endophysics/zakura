@@ -8295,6 +8295,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "pin-project",
+ "privacy-admission-core",
  "proptest",
  "proptest-derive",
  "prost",
