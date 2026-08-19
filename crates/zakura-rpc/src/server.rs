@@ -32,11 +32,11 @@ use zakura_state::{ReadState as ReadStateService, State as StateService};
 
 use crate::{
     config,
-    methods::{RpcImpl, RpcServer as _},
+    methods::RpcImpl,
     server::{
         http_request_compatibility::HttpRequestMiddlewareLayer,
-        rpc_call_compatibility::FixRpcResponseMiddleware, rpc_metrics::RpcMetricsMiddleware,
-        rpc_tracing::RpcTracingMiddleware,
+        rpc_call_compatibility::FixRpcResponseMiddleware, rpc_logger::RpcLoggerMiddleware,
+        rpc_metrics::RpcMetricsMiddleware, rpc_tracing::RpcTracingMiddleware,
     },
 };
 
@@ -44,6 +44,7 @@ pub mod cookie;
 pub mod error;
 pub mod http_request_compatibility;
 pub mod rpc_call_compatibility;
+mod rpc_logger;
 pub mod rpc_metrics;
 pub mod rpc_tracing;
 
@@ -143,10 +144,18 @@ impl RpcServer {
         let http_middleware = tower::ServiceBuilder::new().layer(http_middleware_layer);
 
         let rpc_middleware = RpcServiceBuilder::new()
-            .rpc_logger(1024)
+            .layer_fn(|service| RpcLoggerMiddleware::new(service, 1024))
             .layer_fn(FixRpcResponseMiddleware::new)
             .layer_fn(RpcMetricsMiddleware::new)
             .layer_fn(RpcTracingMiddleware::new);
+
+        let methods = crate::methods::RpcServer::into_rpc(rpc.clone());
+        #[cfg(feature = "privacy-admission")]
+        let methods = {
+            let mut methods = methods;
+            methods.merge(crate::methods::PrivateRpcServer::into_rpc(rpc))?;
+            methods
+        };
 
         if let Some(tls) = conf.tls.clone() {
             let tls_config = load_tls_config(&tls)?;
@@ -163,7 +172,6 @@ impl RpcServer {
                         .expect("should be valid"),
                 )
                 .to_service_builder();
-            let methods = rpc.into_rpc();
             let (stop_handle, server_handle) = stop_channel();
 
             info!("{OPENED_RPC_ENDPOINT_MSG}{local_addr}");
@@ -228,7 +236,7 @@ impl RpcServer {
         info!("{OPENED_RPC_ENDPOINT_MSG}{}", server.local_addr()?);
 
         Ok(tokio::spawn(async move {
-            server.start(rpc.into_rpc()).stopped().await;
+            server.start(methods).stopped().await;
             Ok(())
         }))
     }
