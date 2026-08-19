@@ -61,6 +61,11 @@ pub enum MempoolError {
     #[error("transaction dropped because it is already queued for download")]
     AlreadyQueued,
 
+    /// The same transaction was privately submitted with a different admission identity.
+    #[cfg(feature = "privacy-admission")]
+    #[error("transaction already has a different private admission identity")]
+    ConflictingPrivateAdmission,
+
     /// The queue is at capacity, so this request was ignored.
     ///
     /// The mempool crawler should discover this transaction later.

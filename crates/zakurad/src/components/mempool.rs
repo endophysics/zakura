@@ -26,6 +26,9 @@ use std::{
     task::{Context, Poll},
 };
 
+#[cfg(feature = "privacy-admission")]
+use std::collections::HashMap;
+
 use futures::{future::FutureExt, stream::Stream};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tower::{buffer::Buffer, timeout::Timeout, util::BoxService, Service};
@@ -38,9 +41,12 @@ use zakura_chain::{
 };
 use zakura_consensus::{error::TransactionError, transaction};
 use zakura_network::{self as zn, PeerSocketAddr};
+#[cfg(feature = "privacy-admission")]
+use zakura_node_services::mempool::AdmissionContext;
+use zakura_node_services::mempool::Gossip;
 use zakura_node_services::mempool::{
-    CreatedOrSpent, Gossip, MempoolChange, MempoolDisabledError, MempoolTxSubscriber, QueueSource,
-    Request, Response,
+    AdmissionOrigin, CreatedOrSpent, MempoolChange, MempoolDisabledError, MempoolTxSubscriber,
+    QueueSource, Request, Response,
 };
 use zakura_state as zs;
 use zakura_state::{ChainTipChange, TipAction};
@@ -74,8 +80,8 @@ pub use storage::{
 pub use self::tests::UnboxMempoolError;
 
 use downloads::{
-    Downloads as TxDownloads, TransactionDownloadVerifyError, TRANSACTION_DOWNLOAD_TIMEOUT,
-    TRANSACTION_VERIFY_TIMEOUT,
+    Downloads as TxDownloads, PendingTransaction, TransactionDownloadVerifyError,
+    TRANSACTION_DOWNLOAD_TIMEOUT, TRANSACTION_VERIFY_TIMEOUT,
 };
 
 fn legacy_peer_log_label(addr: PeerSocketAddr, expose_peer_addresses: bool) -> String {
@@ -115,6 +121,50 @@ type TxVerifier = Buffer<
     transaction::Request,
 >;
 type InboundTxDownloads = TxDownloads<Timeout<Outbound>, Timeout<TxVerifier>, State>;
+
+struct QueueAdmission {
+    transactions: Vec<Gossip>,
+    origin: AdmissionOrigin,
+}
+
+fn queue_admission(
+    storage: &mut Storage,
+    tx_downloads: &mut Pin<Box<InboundTxDownloads>>,
+    admission: QueueAdmission,
+) -> Vec<Result<oneshot::Receiver<Result<(), BoxError>>, BoxError>> {
+    admission
+        .transactions
+        .into_iter()
+        .map(
+            |gossiped_tx| -> Result<oneshot::Receiver<Result<(), BoxError>>, MempoolError> {
+                let (rsp_tx, rsp_rx) = oneshot::channel();
+                match storage.should_download_or_verify(gossiped_tx.id()) {
+                    Ok(()) => {}
+                    Err(
+                        error @ MempoolError::StorageExactTip(
+                            ExactTipRejectionError::FailedStandard(
+                                storage::NonStandardTransactionError::TransactionTooLarge {
+                                    ..
+                                },
+                            ),
+                        ),
+                    ) => {
+                        let _ = rsp_tx.send(Err(error.into()));
+                        return Ok(rsp_rx);
+                    }
+                    Err(error) => return Err(error),
+                }
+                tx_downloads.download_if_needed_and_verify(
+                    PendingTransaction::new(gossiped_tx, admission.origin.clone()),
+                    Some(rsp_tx),
+                )?;
+
+                Ok(rsp_rx)
+            },
+        )
+        .map(|result| result.map_err(BoxError::from))
+        .collect()
+}
 
 fn transaction_misbehavior(
     error: &TransactionDownloadVerifyError,
@@ -164,6 +214,9 @@ enum ActiveState {
         /// by [`Request::TransactionIds`] when a peer requests it.
         pending_gossip_tx_ids: HashSet<UnminedTxId>,
 
+        #[cfg(feature = "privacy-admission")]
+        private_admission_contexts: HashMap<UnminedTxId, AdmissionContext>,
+
         /// Last seen chain tip hash that mempool transactions have been verified against.
         ///
         /// In some tests, this is initialized to the latest chain tip, then updated in `poll_ready()` before each request.
@@ -178,23 +231,41 @@ impl ActiveState {
     }
 
     /// Returns a list of requests that will retry every stored and pending transaction.
-    fn transaction_retry_requests(&self) -> Vec<Gossip> {
+    fn transaction_retry_requests(&self) -> Vec<PendingTransaction> {
         match self {
             ActiveState::Disabled => Vec::new(),
             ActiveState::Enabled {
                 storage,
                 tx_downloads,
+                #[cfg(feature = "privacy-admission")]
+                private_admission_contexts,
                 ..
             } => {
                 let mut transactions = Vec::new();
 
-                let storage = storage
-                    .transactions()
-                    .values()
-                    .map(|tx| tx.transaction.clone().into());
+                let storage = storage.transactions().values().map(|tx| {
+                    let origin = {
+                        #[cfg(feature = "privacy-admission")]
+                        {
+                            let tx_id = tx.transaction.id();
+                            private_admission_contexts
+                                .get(&tx_id)
+                                .copied()
+                                .map(AdmissionOrigin::PrivateLocal)
+                                .unwrap_or(AdmissionOrigin::LegacyLocal)
+                        }
+                        #[cfg(not(feature = "privacy-admission"))]
+                        {
+                            AdmissionOrigin::LegacyLocal
+                        }
+                    };
+                    PendingTransaction::new(tx.transaction.clone().into(), origin)
+                });
                 transactions.extend(storage);
 
-                let pending = tx_downloads.transaction_requests().cloned();
+                let pending = tx_downloads
+                    .transaction_requests()
+                    .map(PendingTransaction::retry);
                 transactions.extend(pending);
 
                 transactions
@@ -431,6 +502,8 @@ impl Mempool {
             storage: storage::Storage::new(&self.config),
             tx_downloads,
             pending_gossip_tx_ids: HashSet::new(),
+            #[cfg(feature = "privacy-admission")]
+            private_admission_contexts: HashMap::new(),
             last_seen_tip_hash,
         };
     }
@@ -659,7 +732,7 @@ impl Service<Request> for Mempool {
                 for tx in tx_retries {
                     // This is just an efficiency optimisation, so we don't care if queueing
                     // transaction requests fails.
-                    let _result = tx_downloads.download_if_needed_and_verify(tx, None, None);
+                    let _result = tx_downloads.download_if_needed_and_verify(tx, None);
                 }
             }
 
@@ -672,6 +745,8 @@ impl Service<Request> for Mempool {
             storage,
             tx_downloads,
             pending_gossip_tx_ids,
+            #[cfg(feature = "privacy-admission")]
+            private_admission_contexts,
             last_seen_tip_hash,
         } = &mut self.active_state
         {
@@ -685,7 +760,7 @@ impl Service<Request> for Mempool {
             // Clean up completed download tasks and add to mempool if successful.
             while let Poll::Ready(Some(result)) = pin!(&mut *tx_downloads).poll_next(cx) {
                 match result {
-                    Ok(Ok((tx, spent_mempool_outpoints, expected_tip_height, rsp_tx))) => {
+                    Ok(Ok((tx, spent_mempool_outpoints, expected_tip_height, rsp_tx, origin))) => {
                         // # Correctness:
                         //
                         // It's okay to use tip height here instead of the tip hash since
@@ -709,14 +784,24 @@ impl Service<Request> for Mempool {
                             if let Ok(inserted_id) = insert_result {
                                 // Save transaction ids that we will send to peers
                                 send_to_peers_ids.insert(inserted_id);
+                                #[cfg(feature = "privacy-admission")]
+                                if let AdmissionOrigin::PrivateLocal(context) = origin {
+                                    private_admission_contexts.insert(inserted_id, context);
+                                }
                             } else {
                                 invalidated_ids.insert(tx_id);
+                                #[cfg(feature = "privacy-admission")]
+                                private_admission_contexts.remove(&tx_id);
                             }
 
                             if !evicted_ids.is_empty() {
                                 // A later insertion can evict a transaction accepted earlier in
                                 // this `poll_ready` pass, so do not advertise it.
                                 send_to_peers_ids.retain(|id| !evicted_ids.contains(id));
+                                #[cfg(feature = "privacy-admission")]
+                                for evicted_id in &evicted_ids {
+                                    private_admission_contexts.remove(evicted_id);
+                                }
                                 invalidated_ids.extend(evicted_ids);
                             }
 
@@ -730,8 +815,7 @@ impl Service<Request> for Mempool {
 
                             // We don't care if re-queueing the transaction request fails.
                             let _result = tx_downloads.download_if_needed_and_verify(
-                                tx.transaction.into(),
-                                None,
+                                PendingTransaction::for_retry(tx.transaction, &origin),
                                 rsp_tx,
                             );
                         }
@@ -848,6 +932,11 @@ impl Service<Request> for Mempool {
                 pending_gossip_tx_ids.retain(|tx_id| {
                     !invalidated_ids.contains(tx_id) && !mined_mempool_ids.contains(tx_id)
                 });
+
+                #[cfg(feature = "privacy-admission")]
+                private_admission_contexts.retain(|tx_id, _context| {
+                    !invalidated_ids.contains(tx_id) && !mined_mempool_ids.contains(tx_id)
+                });
             }
 
             // Send transactions that were rejected to RPC listeners.
@@ -889,6 +978,8 @@ impl Service<Request> for Mempool {
                 storage,
                 tx_downloads,
                 pending_gossip_tx_ids,
+                #[cfg(feature = "privacy-admission")]
+                private_admission_contexts,
                 last_seen_tip_hash,
             } => match req {
                 // Queries
@@ -1007,49 +1098,33 @@ impl Service<Request> for Mempool {
                 // Queue mempool candidates
                 Request::Queue(gossiped_txs) => {
                     trace!(req_count = ?gossiped_txs.len(), "got mempool Queue request");
-
-                    let rsp: Vec<Result<oneshot::Receiver<Result<(), BoxError>>, BoxError>> =
-                        gossiped_txs
-                            .into_iter()
-                            .map(
-                                |gossiped_tx| -> Result<
-                                    oneshot::Receiver<Result<(), BoxError>>,
-                                    MempoolError,
-                                > {
-                                    let (rsp_tx, rsp_rx) = oneshot::channel();
-                                    match storage.should_download_or_verify(gossiped_tx.id()) {
-                                        Ok(()) => {}
-                                        Err(
-                                            error @ MempoolError::StorageExactTip(
-                                                ExactTipRejectionError::FailedStandard(
-                                                    storage::NonStandardTransactionError::TransactionTooLarge {
-                                                        ..
-                                                    },
-                                                ),
-                                            ),
-                                        ) => {
-                                            // A cached policy rejection is a completed admission
-                                            // result, not a failure to queue the request.
-                                            let _ = rsp_tx.send(Err(error.into()));
-                                            return Ok(rsp_rx);
-                                        }
-                                        Err(error) => return Err(error),
-                                    }
-                                    tx_downloads.download_if_needed_and_verify(
-                                        gossiped_tx,
-                                        None,
-                                        Some(rsp_tx),
-                                    )?;
-
-                                    Ok(rsp_rx)
-                                },
-                            )
-                            .map(|result| result.map_err(BoxError::from))
-                            .collect();
+                    let rsp = queue_admission(
+                        storage,
+                        tx_downloads,
+                        QueueAdmission {
+                            transactions: gossiped_txs,
+                            origin: AdmissionOrigin::LegacyLocal,
+                        },
+                    );
 
                     // We've added transactions to the queue
                     self.update_metrics();
 
+                    async move { Ok(Response::Queued(rsp)) }.boxed()
+                }
+
+                Request::QueueFromCrawler(gossiped_txs) => {
+                    trace!(req_count = ?gossiped_txs.len(), "got mempool QueueFromCrawler request");
+                    let rsp = queue_admission(
+                        storage,
+                        tx_downloads,
+                        QueueAdmission {
+                            transactions: gossiped_txs,
+                            origin: AdmissionOrigin::Crawler,
+                        },
+                    );
+
+                    self.update_metrics();
                     async move { Ok(Response::Queued(rsp)) }.boxed()
                 }
 
@@ -1071,8 +1146,10 @@ impl Service<Request> for Mempool {
                             continue;
                         }
                         let _ = tx_downloads.download_if_needed_and_verify(
-                            gossiped_tx,
-                            Some(source.clone()),
+                            PendingTransaction::new(
+                                gossiped_tx,
+                                AdmissionOrigin::Peer(source.clone()),
+                            ),
                             None,
                         );
                     }
@@ -1080,6 +1157,50 @@ impl Service<Request> for Mempool {
                     self.update_metrics();
 
                     async move { Ok(Response::Queued(Vec::new())) }.boxed()
+                }
+
+                #[cfg(feature = "privacy-admission")]
+                Request::QueuePrivate {
+                    transaction,
+                    context,
+                } => {
+                    let tx_id = transaction.id();
+                    let result = if private_admission_contexts
+                        .get(&tx_id)
+                        .is_some_and(|existing| existing != &context)
+                    {
+                        Err(MempoolError::ConflictingPrivateAdmission)
+                    } else {
+                        let (rsp_tx, rsp_rx) = oneshot::channel();
+                        match storage.should_download_or_verify(tx_id) {
+                            Ok(()) => tx_downloads
+                                .download_if_needed_and_verify(
+                                    PendingTransaction::new(
+                                        Gossip::Tx(transaction),
+                                        AdmissionOrigin::PrivateLocal(context),
+                                    ),
+                                    Some(rsp_tx),
+                                )
+                                .map(|()| rsp_rx),
+                            Err(
+                                error @ MempoolError::StorageExactTip(
+                                    ExactTipRejectionError::FailedStandard(
+                                        storage::NonStandardTransactionError::TransactionTooLarge {
+                                            ..
+                                        },
+                                    ),
+                                ),
+                            ) => {
+                                let _ = rsp_tx.send(Err(error.into()));
+                                Ok(rsp_rx)
+                            }
+                            Err(error) => Err(error),
+                        }
+                    };
+
+                    self.update_metrics();
+                    async move { Ok(Response::Queued(vec![result.map_err(BoxError::from)])) }
+                        .boxed()
                 }
 
                 // Store successfully downloaded and verified transactions in the mempool
@@ -1189,17 +1310,24 @@ impl Service<Request> for Mempool {
                     }
 
                     // Don't queue mempool candidates, because there is no queue.
-                    Request::Queue(gossiped_txs) => Response::Queued(
-                        // Special case; we can signal the error inside the response,
-                        // because the inbound service ignores inner errors.
-                        iter::repeat_n(MempoolError::Disabled, gossiped_txs.len())
-                            .map(BoxError::from)
-                            .map(Err)
-                            .collect(),
-                    ),
+                    Request::Queue(gossiped_txs) | Request::QueueFromCrawler(gossiped_txs) => {
+                        Response::Queued(
+                            // Special case; we can signal the error inside the response,
+                            // because the inbound service ignores inner errors.
+                            iter::repeat_n(MempoolError::Disabled, gossiped_txs.len())
+                                .map(BoxError::from)
+                                .map(Err)
+                                .collect(),
+                        )
+                    }
 
                     // Drop peer-advertised txids when the mempool is disabled.
                     Request::QueueFromPeer { .. } => Response::Queued(Vec::new()),
+
+                    #[cfg(feature = "privacy-admission")]
+                    Request::QueuePrivate { .. } => {
+                        Response::Queued(vec![Err(BoxError::from(MempoolError::Disabled))])
+                    }
 
                     // Check if the mempool should be enabled.
                     // This request makes sure mempools are debug-enabled in the acceptance tests.

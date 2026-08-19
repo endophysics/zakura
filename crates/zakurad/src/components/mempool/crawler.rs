@@ -273,7 +273,7 @@ where
             .mempool
             .ready()
             .await?
-            .call(mempool::Request::Queue(transaction_ids))
+            .call(mempool::Request::QueueFromCrawler(transaction_ids))
             .await;
 
         let queue_errors = match call_result {
