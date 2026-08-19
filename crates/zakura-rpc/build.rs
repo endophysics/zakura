@@ -52,8 +52,16 @@ fn build_or_copy_proto() -> Result<(), Box<dyn std::error::Error>> {
 fn build_rpc_schema() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = env::var("OUT_DIR").map(PathBuf::from)?;
     let json_rpc_methods_rs = "src/methods.rs";
-    let trait_names = ["Rpc"];
+    let mut trait_names = vec!["Rpc"];
+    if env::var_os("CARGO_FEATURE_PRIVACY_ADMISSION").is_some() {
+        trait_names.push("PrivateRpc");
+    }
     openrpsee::generate_openrpc(json_rpc_methods_rs, &trait_names, false, &out_dir)?;
+
+    // AdmissionId is serde-transparent over u64, but the external type cannot implement JsonSchema here.
+    let rpc_openrpc_path = out_dir.join("rpc_openrpc.rs");
+    let generated = fs::read_to_string(&rpc_openrpc_path)?.replace("mempool :: AdmissionId", "u64");
+    fs::write(rpc_openrpc_path, generated)?;
 
     Ok(())
 }
