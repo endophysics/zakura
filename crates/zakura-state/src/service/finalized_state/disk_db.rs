@@ -596,6 +596,12 @@ impl DiskWriteBatch {
             batch: rocksdb::WriteBatch::default(),
         }
     }
+
+    /// Return the exact serialized RocksDB write-batch size for internal benchmarks.
+    #[cfg(feature = "internal-bench")]
+    pub fn size_in_bytes(&self) -> usize {
+        self.batch.size_in_bytes()
+    }
 }
 
 impl DiskDb {
@@ -1228,6 +1234,53 @@ impl DiskDb {
             .next()
             .transpose()
             .map(|entry| entry.map(|(key, value)| (key.to_vec(), value.to_vec())))
+    }
+
+    /// Read the last raw key/value pair from one column family.
+    pub(crate) fn raw_last_cf<C>(
+        &self,
+        cf: &C,
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+    {
+        self.db
+            .iterator_cf(cf, rocksdb::IteratorMode::End)
+            .next()
+            .transpose()
+            .map(|entry| entry.map(|(key, value)| (key.to_vec(), value.to_vec())))
+    }
+
+    /// Read at most `limit` raw rows at or after `lower` from one column family.
+    ///
+    /// # Performance
+    ///
+    /// This seeks straight to `lower` instead of walking from the start of the key space, so
+    /// deleted keys below `lower` never reach the iterator. A caller that evicts from the low
+    /// end of a column family must bound the read this way: every eviction leaves a tombstone
+    /// at the start of the key space, and a small column family never grows enough to trigger
+    /// the compaction that would collect them, so reading from the start there costs one
+    /// iterator step per eviction ever performed.
+    pub(crate) fn raw_prefix_cf_from<C>(
+        &self,
+        cf: &C,
+        lower: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, rocksdb::Error>
+    where
+        C: rocksdb::AsColumnFamilyRef,
+    {
+        let mut options = ReadOptions::default();
+        options.set_iterate_lower_bound(lower.to_vec());
+        self.db
+            .iterator_cf_opt(
+                cf,
+                options,
+                rocksdb::IteratorMode::From(lower, rocksdb::Direction::Forward),
+            )
+            .take(limit)
+            .map(|entry| entry.map(|(key, value)| (key.to_vec(), value.to_vec())))
+            .collect()
     }
 
     /// Visit raw key/value pairs one at a time without collecting the column family.
