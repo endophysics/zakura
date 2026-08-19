@@ -20,6 +20,7 @@
 
 use std::{
     collections::HashSet,
+    fmt,
     future::Future,
     iter,
     pin::{pin, Pin},
@@ -27,7 +28,10 @@ use std::{
 };
 
 #[cfg(feature = "privacy-admission")]
-use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use futures::{future::FutureExt, stream::Stream};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -39,10 +43,10 @@ use zakura_chain::{
     chain_tip::ChainTip,
     transaction::UnminedTxId,
 };
+#[cfg(feature = "privacy-admission")]
+use zakura_consensus::VERIFIER_BUFFER_BOUND;
 use zakura_consensus::{error::TransactionError, transaction};
 use zakura_network::{self as zn, PeerSocketAddr};
-#[cfg(feature = "privacy-admission")]
-use zakura_node_services::mempool::AdmissionContext;
 use zakura_node_services::mempool::Gossip;
 use zakura_node_services::mempool::{
     AdmissionOrigin, CreatedOrSpent, MempoolChange, MempoolDisabledError, MempoolTxSubscriber,
@@ -59,6 +63,12 @@ pub mod downloads;
 mod error;
 pub mod gossip;
 mod pending_outputs;
+#[cfg(feature = "privacy-admission")]
+pub mod private_pool;
+#[cfg(feature = "privacy-admission")]
+mod private_release_scheduler;
+#[cfg(feature = "privacy-admission")]
+mod private_state;
 mod queue_checker;
 mod storage;
 
@@ -71,10 +81,83 @@ pub use config::Config;
 pub use crawler::Crawler;
 pub use error::MempoolError;
 pub(crate) use gossip::run_mempool_transaction_id_gossip;
+#[cfg(feature = "privacy-admission")]
+pub(crate) use private_release_scheduler::PrivateReleaseScheduler;
 pub use queue_checker::QueueChecker;
 pub use storage::{
     ExactTipRejectionError, SameEffectsChainRejectionError, SameEffectsTipRejectionError, Storage,
 };
+
+#[cfg(feature = "privacy-admission")]
+struct PrivateLifecycle {
+    operations_open: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "privacy-admission")]
+impl PrivateLifecycle {
+    fn new() -> Self {
+        Self {
+            operations_open: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn control(&self) -> PrivateLifecycleControl {
+        PrivateLifecycleControl {
+            operations_open: Arc::clone(&self.operations_open),
+        }
+    }
+
+    fn accepts_operations(&self) -> bool {
+        self.operations_open.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(feature = "privacy-admission")]
+pub(crate) struct PrivateLifecycleControl {
+    operations_open: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "privacy-admission")]
+impl PrivateLifecycleControl {
+    pub(crate) fn close(&self) {
+        self.operations_open.store(false, Ordering::Release);
+    }
+}
+
+/// Canonical chain tip used for contextual mempool verification.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct VerificationTip {
+    hash_and_height: Option<(block::Hash, Height)>,
+}
+
+impl VerificationTip {
+    /// Construct verification metadata from a canonical block hash and height.
+    pub const fn new(hash_and_height: Option<(block::Hash, Height)>) -> Self {
+        Self { hash_and_height }
+    }
+
+    /// Return the canonical block hash and height.
+    pub const fn hash_and_height(self) -> Option<(block::Hash, Height)> {
+        self.hash_and_height
+    }
+
+    /// Return the canonical block height.
+    pub const fn height(self) -> Option<Height> {
+        match self.hash_and_height {
+            Some((_hash, height)) => Some(height),
+            None => None,
+        }
+    }
+}
+
+impl fmt::Debug for VerificationTip {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VerificationTip(private)")
+    }
+}
+
+#[cfg(feature = "privacy-admission")]
+use private_state::{PrivateAdmissionState, PrivateReservationOutcome};
 
 #[cfg(test)]
 pub use self::tests::UnboxMempoolError;
@@ -207,15 +290,16 @@ enum ActiveState {
         /// The transaction download and verify stream.
         tx_downloads: Pin<Box<InboundTxDownloads>>,
 
+        #[cfg(feature = "privacy-admission")]
+        /// The private transaction download and verify stream.
+        private_tx_downloads: Pin<Box<InboundTxDownloads>>,
+
         /// Verified transaction IDs awaiting proactive advertisement through
         /// the peer set.
         ///
         /// This pending set is separate from the full mempool inventory served
         /// by [`Request::TransactionIds`] when a peer requests it.
         pending_gossip_tx_ids: HashSet<UnminedTxId>,
-
-        #[cfg(feature = "privacy-admission")]
-        private_admission_contexts: HashMap<UnminedTxId, AdmissionContext>,
 
         /// Last seen chain tip hash that mempool transactions have been verified against.
         ///
@@ -237,28 +321,12 @@ impl ActiveState {
             ActiveState::Enabled {
                 storage,
                 tx_downloads,
-                #[cfg(feature = "privacy-admission")]
-                private_admission_contexts,
                 ..
             } => {
                 let mut transactions = Vec::new();
 
                 let storage = storage.transactions().values().map(|tx| {
-                    let origin = {
-                        #[cfg(feature = "privacy-admission")]
-                        {
-                            let tx_id = tx.transaction.id();
-                            private_admission_contexts
-                                .get(&tx_id)
-                                .copied()
-                                .map(AdmissionOrigin::PrivateLocal)
-                                .unwrap_or(AdmissionOrigin::LegacyLocal)
-                        }
-                        #[cfg(not(feature = "privacy-admission"))]
-                        {
-                            AdmissionOrigin::LegacyLocal
-                        }
-                    };
+                    let origin = AdmissionOrigin::LegacyLocal;
                     PendingTransaction::new(tx.transaction.clone().into(), origin)
                 });
                 transactions.extend(storage);
@@ -270,6 +338,20 @@ impl ActiveState {
 
                 transactions
             }
+        }
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    fn private_transaction_retry_requests(&self) -> Vec<PendingTransaction> {
+        match self {
+            ActiveState::Disabled => Vec::new(),
+            ActiveState::Enabled {
+                private_tx_downloads,
+                ..
+            } => private_tx_downloads
+                .transaction_requests()
+                .map(PendingTransaction::retry)
+                .collect(),
         }
     }
 
@@ -339,6 +421,12 @@ pub struct Mempool {
 
     /// The state of the mempool.
     active_state: ActiveState,
+
+    #[cfg(feature = "privacy-admission")]
+    private_admission: PrivateAdmissionState,
+
+    #[cfg(feature = "privacy-admission")]
+    private_lifecycle: PrivateLifecycle,
 
     /// Allows checking if we are near the tip to enable/disable the mempool.
     sync_status: SyncStatus,
@@ -416,6 +504,10 @@ impl Mempool {
             config: config.clone(),
             expose_peer_addresses,
             active_state: ActiveState::Disabled,
+            #[cfg(feature = "privacy-admission")]
+            private_admission: PrivateAdmissionState::new(config.private_pool),
+            #[cfg(feature = "privacy-admission")]
+            private_lifecycle: PrivateLifecycle::new(),
             sync_status,
             debug_enable_at_height: config.debug_enable_at_height.map(Height),
             latest_chain_tip,
@@ -440,6 +532,24 @@ impl Mempool {
         service.update_state(None);
 
         (service, transaction_subscriber)
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    pub(crate) fn set_private_scheduler_state(
+        &mut self,
+        state: tokio::sync::watch::Receiver<zakura_node_services::mempool::SchedulerState>,
+    ) {
+        self.private_admission.set_scheduler_state(state);
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    pub(crate) fn private_release_timing(&self) -> private_release_scheduler::PrivateReleaseTiming {
+        self.private_admission.release_timing()
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    pub(crate) fn private_lifecycle_control(&self) -> PrivateLifecycleControl {
+        self.private_lifecycle.control()
     }
 
     /// Is the mempool enabled by a debug config option?
@@ -498,12 +608,28 @@ impl Mempool {
             self.expose_peer_addresses,
             self.config.max_transaction_bytes,
         ));
+        #[cfg(feature = "privacy-admission")]
+        let private_tx_downloads = Box::pin(
+            TxDownloads::new(
+                Timeout::new(self.outbound.clone(), TRANSACTION_DOWNLOAD_TIMEOUT),
+                Timeout::new(self.tx_verifier.clone(), TRANSACTION_VERIFY_TIMEOUT),
+                self.state.clone(),
+                self.expose_peer_addresses,
+                self.config.max_transaction_bytes,
+            )
+            .with_capacity(
+                self.config
+                    .private_pool
+                    .max_transactions()
+                    .min(VERIFIER_BUFFER_BOUND - 1),
+            ),
+        );
         self.active_state = ActiveState::Enabled {
             storage: storage::Storage::new(&self.config),
             tx_downloads,
-            pending_gossip_tx_ids: HashSet::new(),
             #[cfg(feature = "privacy-admission")]
-            private_admission_contexts: HashMap::new(),
+            private_tx_downloads,
+            pending_gossip_tx_ids: HashSet::new(),
             last_seen_tip_hash,
         };
     }
@@ -697,8 +823,30 @@ impl Service<Request> for Mempool {
                 "resetting mempool: switched best chain, skipped blocks, or activated network upgrade"
             );
 
+            #[cfg(feature = "privacy-admission")]
+            let retained_retries = self
+                .private_admission
+                .begin_revalidation(
+                    VerificationTip::new(
+                        tip_action
+                            .as_ref()
+                            .map(|action| action.best_tip_hash_and_height()),
+                    ),
+                    true,
+                )
+                .into_iter()
+                .map(|record| {
+                    PendingTransaction::new(
+                        Gossip::Tx(record.transaction().transaction.clone()),
+                        AdmissionOrigin::PrivateLocal(record.context()),
+                    )
+                })
+                .collect::<Vec<_>>();
+
             let previous_state = self.active_state.take();
             let tx_retries = previous_state.transaction_retry_requests();
+            #[cfg(feature = "privacy-admission")]
+            let private_tx_retries = previous_state.private_transaction_retry_requests();
 
             // Use the same code for dropping and resetting the mempool,
             // to avoid subtle bugs.
@@ -723,7 +871,13 @@ impl Service<Request> for Mempool {
 
             // Re-verify the transactions that were pending or valid at the previous tip.
             // This saves us the time and data needed to re-download them.
-            if let ActiveState::Enabled { tx_downloads, .. } = &mut self.active_state {
+            if let ActiveState::Enabled {
+                tx_downloads,
+                #[cfg(feature = "privacy-admission")]
+                private_tx_downloads,
+                ..
+            } = &mut self.active_state
+            {
                 info!(
                     transactions = tx_retries.len(),
                     "re-verifying mempool transactions after a chain fork"
@@ -733,6 +887,20 @@ impl Service<Request> for Mempool {
                     // This is just an efficiency optimisation, so we don't care if queueing
                     // transaction requests fails.
                     let _result = tx_downloads.download_if_needed_and_verify(tx, None);
+                }
+
+                #[cfg(feature = "privacy-admission")]
+                for tx in private_tx_retries.into_iter().chain(retained_retries) {
+                    let transaction_id = tx.gossip().id();
+                    let origin = tx.origin().clone();
+                    let result = private_tx_downloads.download_if_needed_and_verify(tx, None);
+                    if result.is_err() {
+                        if let AdmissionOrigin::PrivateLocal(context) = origin {
+                            self.private_admission
+                                .revalidation_queue_failed(transaction_id, context);
+                            self.private_admission.cancel_reservation(context);
+                        }
+                    }
                 }
             }
 
@@ -744,9 +912,9 @@ impl Service<Request> for Mempool {
         if let ActiveState::Enabled {
             storage,
             tx_downloads,
-            pending_gossip_tx_ids,
             #[cfg(feature = "privacy-admission")]
-            private_admission_contexts,
+            private_tx_downloads,
+            pending_gossip_tx_ids,
             last_seen_tip_hash,
         } = &mut self.active_state
         {
@@ -755,118 +923,162 @@ impl Service<Request> for Mempool {
             let mut invalidated_ids = HashSet::<_>::new();
             let mut mined_mempool_ids = HashSet::<_>::new();
 
-            let best_tip_height = self.latest_chain_tip.best_tip_height();
+            let current_tip = tip_action
+                .as_ref()
+                .map(|action| VerificationTip::new(Some(action.best_tip_hash_and_height())))
+                .unwrap_or_else(|| {
+                    VerificationTip::new(
+                        self.latest_chain_tip
+                            .best_tip_height_and_hash()
+                            .map(|(height, hash)| (hash, height)),
+                    )
+                });
+            let best_tip_height = current_tip.height();
+
+            #[cfg(feature = "privacy-admission")]
+            let download_streams = [&mut *tx_downloads, &mut *private_tx_downloads];
+            #[cfg(not(feature = "privacy-admission"))]
+            let download_streams = [&mut *tx_downloads];
 
             // Clean up completed download tasks and add to mempool if successful.
-            while let Poll::Ready(Some(result)) = pin!(&mut *tx_downloads).poll_next(cx) {
-                match result {
-                    Ok(Ok((tx, spent_mempool_outpoints, expected_tip_height, rsp_tx, origin))) => {
-                        // # Correctness:
-                        //
-                        // It's okay to use tip height here instead of the tip hash since
-                        // chain_tip_change.last_tip_change() returns a `TipAction::Reset` when
-                        // the best chain changes (which is the only way to stay at the same height), and the
-                        // mempool re-verifies all pending tx_downloads when there's a `TipAction::Reset`.
-                        if best_tip_height == expected_tip_height {
-                            let tx_id = tx.transaction.id();
-                            let (insert_result, evicted_ids) = storage.insert_with_evicted_ids(
-                                tx,
-                                spent_mempool_outpoints,
-                                best_tip_height,
-                            );
-
-                            tracing::trace!(
-                                ?insert_result,
-                                ?evicted_ids,
-                                "got Ok(_) transaction verify, tried to store",
-                            );
-
-                            if let Ok(inserted_id) = insert_result {
-                                // Save transaction ids that we will send to peers
-                                send_to_peers_ids.insert(inserted_id);
+            for tx_downloads in download_streams {
+                while let Poll::Ready(Some(result)) = pin!(&mut *tx_downloads).poll_next(cx) {
+                    match result {
+                        Ok(Ok((tx, spent_mempool_outpoints, verification_tip, rsp_tx, origin))) => {
+                            if current_tip == verification_tip {
                                 #[cfg(feature = "privacy-admission")]
                                 if let AdmissionOrigin::PrivateLocal(context) = origin {
-                                    private_admission_contexts.insert(inserted_id, context);
+                                    self.private_admission.complete_verified(
+                                        tx,
+                                        spent_mempool_outpoints,
+                                        verification_tip,
+                                        context,
+                                    );
+                                    continue;
+                                }
+                                let tx_id = tx.transaction.id();
+                                let (insert_result, evicted_ids) = storage.insert_with_evicted_ids(
+                                    tx,
+                                    spent_mempool_outpoints,
+                                    best_tip_height,
+                                );
+
+                                tracing::trace!(
+                                    ?insert_result,
+                                    ?evicted_ids,
+                                    "got Ok(_) transaction verify, tried to store",
+                                );
+
+                                if let Ok(inserted_id) = insert_result {
+                                    // Save transaction ids that we will send to peers
+                                    send_to_peers_ids.insert(inserted_id);
+                                } else {
+                                    invalidated_ids.insert(tx_id);
+                                }
+
+                                if !evicted_ids.is_empty() {
+                                    // A later insertion can evict a transaction accepted earlier in
+                                    // this `poll_ready` pass, so do not advertise it.
+                                    send_to_peers_ids.retain(|id| !evicted_ids.contains(id));
+                                    invalidated_ids.extend(evicted_ids);
+                                }
+
+                                // Send the result to responder channel if one was provided.
+                                if let Some(rsp_tx) = rsp_tx {
+                                    let _ = rsp_tx
+                                        .send(insert_result.map(|_| ()).map_err(|err| err.into()));
                                 }
                             } else {
-                                invalidated_ids.insert(tx_id);
-                                #[cfg(feature = "privacy-admission")]
-                                private_admission_contexts.remove(&tx_id);
-                            }
+                                tracing::trace!("chain grew during tx verification, retrying ..",);
 
-                            if !evicted_ids.is_empty() {
-                                // A later insertion can evict a transaction accepted earlier in
-                                // this `poll_ready` pass, so do not advertise it.
-                                send_to_peers_ids.retain(|id| !evicted_ids.contains(id));
+                                // We don't care if re-queueing the transaction request fails.
                                 #[cfg(feature = "privacy-admission")]
-                                for evicted_id in &evicted_ids {
-                                    private_admission_contexts.remove(evicted_id);
+                                let transaction_id = tx.transaction.id();
+                                #[cfg(feature = "privacy-admission")]
+                                let result = tx_downloads.download_if_needed_and_verify(
+                                    PendingTransaction::for_retry(tx.transaction, &origin),
+                                    rsp_tx,
+                                );
+                                #[cfg(not(feature = "privacy-admission"))]
+                                let _result = tx_downloads.download_if_needed_and_verify(
+                                    PendingTransaction::for_retry(tx.transaction, &origin),
+                                    rsp_tx,
+                                );
+                                #[cfg(feature = "privacy-admission")]
+                                if result.is_err() {
+                                    if let AdmissionOrigin::PrivateLocal(context) = origin {
+                                        self.private_admission
+                                            .revalidation_queue_failed(transaction_id, context);
+                                    }
                                 }
-                                invalidated_ids.extend(evicted_ids);
+                            }
+                        }
+                        Ok(Err(boxed_err)) => {
+                            let (tx_id, error, origin) = *boxed_err;
+                            #[cfg(not(feature = "privacy-admission"))]
+                            let _ = &origin;
+                            #[cfg(feature = "privacy-admission")]
+                            if let AdmissionOrigin::PrivateLocal(context) = origin {
+                                self.private_admission.fail(tx_id, context, error);
+                                continue;
+                            }
+                            if let Some((advertiser_addr, score)) = transaction_misbehavior(&error)
+                            {
+                                let _ = self.misbehavior_sender.try_send((advertiser_addr, score));
                             }
 
-                            // Send the result to responder channel if one was provided.
-                            if let Some(rsp_tx) = rsp_tx {
-                                let _ = rsp_tx
-                                    .send(insert_result.map(|_| ()).map_err(|err| err.into()));
-                            }
-                        } else {
-                            tracing::trace!("chain grew during tx verification, retrying ..",);
-
-                            // We don't care if re-queueing the transaction request fails.
-                            let _result = tx_downloads.download_if_needed_and_verify(
-                                PendingTransaction::for_retry(tx.transaction, &origin),
-                                rsp_tx,
+                            let peer_label = transaction_error_peer_log_label(
+                                &error,
+                                self.expose_peer_addresses,
                             );
+                            let peer = peer_label.as_deref().unwrap_or("none");
+                            tracing::debug!(
+                                ?tx_id,
+                                ?error,
+                                peer = %peer,
+                                "mempool transaction was not accepted"
+                            );
+
+                            match &error {
+                                TransactionDownloadVerifyError::PolicyRejected(
+                                    storage::NonStandardTransactionError::TransactionTooLarge {
+                                        ..
+                                    },
+                                ) => metrics::counter!(
+                                    "mempool.rejected.transactions.total",
+                                    "reason" => "transaction_too_large"
+                                )
+                                .increment(1),
+                                _ => metrics::counter!(
+                                    "mempool.failed.verify.tasks.total",
+                                    "reason" => error.to_string()
+                                )
+                                .increment(1),
+                            }
+
+                            invalidated_ids.insert(tx_id);
+                            storage.reject_if_needed(tx_id, error);
                         }
-                    }
-                    Ok(Err(boxed_err)) => {
-                        let (tx_id, error) = *boxed_err;
-                        if let Some((advertiser_addr, score)) = transaction_misbehavior(&error) {
-                            let _ = self.misbehavior_sender.try_send((advertiser_addr, score));
+                        Err((tx_id, _elapsed, origin)) => {
+                            #[cfg(not(feature = "privacy-admission"))]
+                            let _ = &origin;
+                            #[cfg(feature = "privacy-admission")]
+                            if let AdmissionOrigin::PrivateLocal(context) = origin {
+                                self.private_admission
+                                    .revalidation_timed_out(tx_id, context);
+                                continue;
+                            }
+                            tracing::info!(
+                                ?tx_id,
+                                "mempool transaction failed to verify due to timeout"
+                            );
+
+                            invalidated_ids.insert(tx_id);
+
+                            metrics::counter!("mempool.failed.verify.tasks.total", "reason" => "timeout").increment(1);
                         }
-
-                        let peer_label =
-                            transaction_error_peer_log_label(&error, self.expose_peer_addresses);
-                        let peer = peer_label.as_deref().unwrap_or("none");
-                        tracing::debug!(
-                            ?tx_id,
-                            ?error,
-                            peer = %peer,
-                            "mempool transaction was not accepted"
-                        );
-
-                        match &error {
-                            TransactionDownloadVerifyError::PolicyRejected(
-                                storage::NonStandardTransactionError::TransactionTooLarge {
-                                    ..
-                                },
-                            ) => metrics::counter!(
-                                "mempool.rejected.transactions.total",
-                                "reason" => "transaction_too_large"
-                            )
-                            .increment(1),
-                            _ => metrics::counter!(
-                                "mempool.failed.verify.tasks.total",
-                                "reason" => error.to_string()
-                            )
-                            .increment(1),
-                        }
-
-                        invalidated_ids.insert(tx_id);
-                        storage.reject_if_needed(tx_id, error);
-                    }
-                    Err((tx_id, _elapsed)) => {
-                        tracing::info!(
-                            ?tx_id,
-                            "mempool transaction failed to verify due to timeout"
-                        );
-
-                        invalidated_ids.insert(tx_id);
-
-                        metrics::counter!("mempool.failed.verify.tasks.total", "reason" => "timeout").increment(1);
-                    }
-                };
+                    };
+                }
             }
 
             // Handle best chain tip changes
@@ -877,7 +1089,11 @@ impl Service<Request> for Mempool {
                 // Cancel downloads/verifications/storage of transactions
                 // with the same mined IDs as recently mined transactions.
                 let mined_ids = block.transaction_hashes.iter().cloned().collect();
+                #[cfg(feature = "privacy-admission")]
+                self.private_admission.remove_mined(&mined_ids)?;
                 tx_downloads.cancel(&mined_ids);
+                #[cfg(feature = "privacy-admission")]
+                private_tx_downloads.cancel(&mined_ids);
                 storage.clear_mined_dependencies(&mined_ids);
 
                 let storage::RemovedTransactionIds { mined, invalidated } =
@@ -889,6 +1105,26 @@ impl Service<Request> for Mempool {
 
                 mined_mempool_ids.extend(mined);
                 invalidated_ids.extend(invalidated);
+
+                #[cfg(feature = "privacy-admission")]
+                for record in self
+                    .private_admission
+                    .begin_revalidation(current_tip, false)
+                {
+                    let transaction_id = record.transaction_id();
+                    let context = record.context();
+                    let result = private_tx_downloads.download_if_needed_and_verify(
+                        PendingTransaction::new(
+                            Gossip::Tx(record.transaction().transaction.clone()),
+                            AdmissionOrigin::PrivateLocal(context),
+                        ),
+                        None,
+                    );
+                    if result.is_err() {
+                        self.private_admission
+                            .revalidation_queue_failed(transaction_id, context);
+                    }
+                }
             }
 
             // Remove expired transactions from the mempool.
@@ -932,11 +1168,6 @@ impl Service<Request> for Mempool {
                 pending_gossip_tx_ids.retain(|tx_id| {
                     !invalidated_ids.contains(tx_id) && !mined_mempool_ids.contains(tx_id)
                 });
-
-                #[cfg(feature = "privacy-admission")]
-                private_admission_contexts.retain(|tx_id, _context| {
-                    !invalidated_ids.contains(tx_id) && !mined_mempool_ids.contains(tx_id)
-                });
             }
 
             // Send transactions that were rejected to RPC listeners.
@@ -973,13 +1204,22 @@ impl Service<Request> for Mempool {
     /// and will cause callers to disconnect from the remote peer.
     #[instrument(name = "mempool", skip(self, req))]
     fn call(&mut self, req: Request) -> Self::Future {
+        #[cfg(feature = "privacy-admission")]
+        if matches!(
+            &req,
+            Request::QueuePrivate { .. } | Request::PromotePrivateDue
+        ) && !self.private_lifecycle.accepts_operations()
+        {
+            return async move { Err(MempoolError::PrivateOperationsClosed.into()) }.boxed();
+        }
+
         match &mut self.active_state {
             ActiveState::Enabled {
                 storage,
                 tx_downloads,
-                pending_gossip_tx_ids,
                 #[cfg(feature = "privacy-admission")]
-                private_admission_contexts,
+                private_tx_downloads,
+                pending_gossip_tx_ids,
                 last_seen_tip_hash,
             } => match req {
                 // Queries
@@ -1164,43 +1404,109 @@ impl Service<Request> for Mempool {
                     transaction,
                     context,
                 } => {
-                    let tx_id = transaction.id();
-                    let result = if private_admission_contexts
-                        .get(&tx_id)
-                        .is_some_and(|existing| existing != &context)
-                    {
-                        Err(MempoolError::ConflictingPrivateAdmission)
-                    } else {
-                        let (rsp_tx, rsp_rx) = oneshot::channel();
-                        match storage.should_download_or_verify(tx_id) {
-                            Ok(()) => tx_downloads
-                                .download_if_needed_and_verify(
-                                    PendingTransaction::new(
-                                        Gossip::Tx(transaction),
-                                        AdmissionOrigin::PrivateLocal(context),
-                                    ),
-                                    Some(rsp_tx),
-                                )
-                                .map(|()| rsp_rx),
-                            Err(
-                                error @ MempoolError::StorageExactTip(
-                                    ExactTipRejectionError::FailedStandard(
-                                        storage::NonStandardTransactionError::TransactionTooLarge {
-                                            ..
-                                        },
-                                    ),
+                    let reservation = self.private_admission.reserve(transaction.clone(), context);
+                    let response = match reservation {
+                        Ok(PrivateReservationOutcome::Existing) => Ok(Response::PrivateQueued {
+                            status: zakura_node_services::mempool::PrivateAdmissionStatus::Existing,
+                            completion: None,
+                        }),
+                        Ok(PrivateReservationOutcome::Accepted(completion)) => {
+                            match private_tx_downloads.download_if_needed_and_verify(
+                                PendingTransaction::new(
+                                    Gossip::Tx(transaction),
+                                    AdmissionOrigin::PrivateLocal(context),
                                 ),
-                            ) => {
-                                let _ = rsp_tx.send(Err(error.into()));
-                                Ok(rsp_rx)
+                                None,
+                            ) {
+                                Ok(()) => Ok(Response::PrivateQueued {
+                                    status: zakura_node_services::mempool::PrivateAdmissionStatus::Accepted,
+                                    completion: Some(completion),
+                                }),
+                                Err(error) => {
+                                    self.private_admission.cancel_reservation(context);
+                                    Err(error.into())
+                                }
                             }
-                            Err(error) => Err(error),
                         }
+                        Err(error) => Err(error.into()),
                     };
+                    async move { response }.boxed()
+                }
 
+                #[cfg(feature = "privacy-admission")]
+                Request::PrivatePoolDiagnostics => {
+                    let diagnostics = self.private_admission.diagnostics();
+                    async move { Ok(Response::PrivatePoolDiagnostics(diagnostics)) }.boxed()
+                }
+
+                #[cfg(feature = "privacy-admission")]
+                Request::PromotePrivateDue => {
+                    let current_tip = VerificationTip::new(
+                        self.latest_chain_tip
+                            .best_tip_height_and_hash()
+                            .map(|(height, hash)| (hash, height)),
+                    );
+                    match self.private_admission.remove_expired(current_tip.height()) {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            self.update_metrics();
+                            return async move {
+                                Ok(Response::PrivatePromoted(
+                                    zakura_node_services::mempool::PrivatePromotionOutcome::Terminal {
+                                        count,
+                                    },
+                                ))
+                            }
+                            .boxed();
+                        }
+                        Err(error) => return async move { Err(error) }.boxed(),
+                    }
+                    let stale_records = self
+                        .private_admission
+                        .begin_revalidation(current_tip, false);
+                    let excluded = stale_records
+                        .iter()
+                        .map(|record| record.admission_id())
+                        .collect::<HashSet<_>>();
+                    for record in stale_records {
+                        let transaction_id = record.transaction_id();
+                        let context = record.context();
+                        let queue_result = private_tx_downloads.download_if_needed_and_verify(
+                            PendingTransaction::new(
+                                Gossip::Tx(record.transaction().transaction.clone()),
+                                AdmissionOrigin::PrivateLocal(context),
+                            ),
+                            None,
+                        );
+                        if queue_result.is_err() {
+                            self.private_admission
+                                .revalidation_queue_failed(transaction_id, context);
+                        }
+                    }
+
+                    let effects = self.private_admission.promote_due(storage, &excluded);
+                    let outcome = effects.outcome;
+                    if !effects.accepted.is_empty() {
+                        pending_gossip_tx_ids.extend(effects.accepted.iter().copied());
+                        if let Err(error) = self
+                            .transaction_sender
+                            .send(MempoolChange::added(effects.accepted))
+                        {
+                            return async move { Err(error.into()) }.boxed();
+                        }
+                    }
+                    if !effects.evicted.is_empty() {
+                        pending_gossip_tx_ids
+                            .retain(|transaction_id| !effects.evicted.contains(transaction_id));
+                        if let Err(error) = self
+                            .transaction_sender
+                            .send(MempoolChange::invalidated(effects.evicted))
+                        {
+                            return async move { Err(error.into()) }.boxed();
+                        }
+                    }
                     self.update_metrics();
-                    async move { Ok(Response::Queued(vec![result.map_err(BoxError::from)])) }
-                        .boxed()
+                    async move { Ok(Response::PrivatePromoted(outcome)) }.boxed()
                 }
 
                 // Store successfully downloaded and verified transactions in the mempool
@@ -1326,8 +1632,20 @@ impl Service<Request> for Mempool {
 
                     #[cfg(feature = "privacy-admission")]
                     Request::QueuePrivate { .. } => {
-                        Response::Queued(vec![Err(BoxError::from(MempoolError::Disabled))])
+                        return async move { Err(BoxError::from(MempoolError::Disabled)) }.boxed()
                     }
+
+                    #[cfg(feature = "privacy-admission")]
+                    Request::PrivatePoolDiagnostics => {
+                        Response::PrivatePoolDiagnostics(self.private_admission.diagnostics())
+                    }
+
+                    #[cfg(feature = "privacy-admission")]
+                    Request::PromotePrivateDue => Response::PrivatePromoted(
+                        zakura_node_services::mempool::PrivatePromotionOutcome::Recoverable {
+                            count: self.private_admission.diagnostics().transaction_count,
+                        },
+                    ),
 
                     // Check if the mempool should be enabled.
                     // This request makes sure mempools are debug-enabled in the acceptance tests.

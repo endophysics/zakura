@@ -66,12 +66,33 @@ pub enum MempoolError {
     #[error("transaction already has a different private admission identity")]
     ConflictingPrivateAdmission,
 
+    /// A private admission identifier already belongs to another transaction.
+    #[cfg(feature = "privacy-admission")]
+    #[error("private admission identity conflicts with an existing request")]
+    PrivateAdmissionIdConflict,
+
+    /// A private admission identifier is already terminal in the admission core.
+    #[cfg(feature = "privacy-admission")]
+    #[error("private admission is already terminal")]
+    TerminalPrivateAdmission,
+
+    /// Combined retained and in-flight private capacity is full.
+    #[cfg(feature = "privacy-admission")]
+    #[error("private transaction capacity is full")]
+    PrivatePoolFull,
+
+    /// Private admission and promotion are closed during orderly shutdown.
+    #[cfg(feature = "privacy-admission")]
+    #[error("private mempool operations are closed for shutdown")]
+    PrivateOperationsClosed,
+
     /// The queue is at capacity, so this request was ignored.
     ///
     /// The mempool crawler should discover this transaction later.
     /// If it is mined into a block, it will be downloaded by the syncer, or the inbound block downloader.
     ///
-    /// The queue's capacity is [`super::downloads::MAX_INBOUND_CONCURRENCY`].
+    /// The public queue's capacity is [`super::downloads::MAX_INBOUND_CONCURRENCY`].
+    /// Private verification uses the configured private transaction-count limit.
     #[error("transaction dropped because the queue is full")]
     FullQueue,
 

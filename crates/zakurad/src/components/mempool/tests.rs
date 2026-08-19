@@ -18,12 +18,9 @@ use zakura_chain::{
     transaction::{Transaction, UnminedTx, VerifiedUnminedTx},
     transparent::{self, Address},
 };
+#[cfg(feature = "privacy-admission")]
+use zakura_node_services::mempool::AdmissionId;
 use zakura_node_services::mempool::QueueSource;
-
-#[cfg(feature = "privacy-admission")]
-use zakura_chain::transaction::UnminedTxId;
-#[cfg(feature = "privacy-admission")]
-use zakura_node_services::mempool::AdmissionContext;
 
 mod prop;
 mod vector;
@@ -78,14 +75,39 @@ impl Mempool {
     }
 
     #[cfg(feature = "privacy-admission")]
-    pub fn private_admission_context(&self, tx_id: &UnminedTxId) -> Option<AdmissionContext> {
+    pub fn private_tx_downloads(&self) -> &Pin<Box<InboundTxDownloads>> {
         match &self.active_state {
-            ActiveState::Disabled => None,
+            ActiveState::Disabled => panic!("mempool must be enabled"),
             ActiveState::Enabled {
-                private_admission_contexts,
+                private_tx_downloads,
                 ..
-            } => private_admission_contexts.get(tx_id).copied(),
+            } => private_tx_downloads,
         }
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    pub fn private_record(
+        &self,
+        admission_id: AdmissionId,
+    ) -> Option<&super::private_pool::PrivateRecord> {
+        self.private_admission.retained_record(admission_id)
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    pub fn private_schedule(&self, admission_id: AdmissionId) -> Option<(u64, u64)> {
+        self.private_admission.schedule(admission_id)
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    pub fn private_diagnostics(&self) -> zakura_node_services::mempool::PrivatePoolDiagnostics {
+        self.private_admission.diagnostics()
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    pub fn private_batch_available(&self, admission_id: AdmissionId) -> bool {
+        self.private_admission
+            .snapshot_batch(&[admission_id])
+            .is_ok()
     }
 
     /// Enable the mempool by pretending the synchronization is close to the tip.
