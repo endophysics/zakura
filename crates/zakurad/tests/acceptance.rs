@@ -4733,6 +4733,13 @@ async fn zcashd_compat_transparent_tx_in_mempool() -> Result<()> {
     common::zcashd_compat::tx_flow::transparent_tx_in_mempool().await
 }
 
+#[cfg(feature = "privacy-admission")]
+#[tokio::test]
+#[ignore = "human inspection of real private admission and scheduled P2P release"]
+async fn zcashd_compat_inspect_private_release() -> Result<()> {
+    common::zcashd_compat::tx_flow::inspect_private_release().await
+}
+
 /// Rejects a transaction above Zakura's mempool size limit, then accepts it in a block.
 ///
 /// See [`common::zcashd_compat::tx_flow::oversized_transparent_tx_rejected`] for details.
