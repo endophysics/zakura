@@ -53,6 +53,10 @@ pub struct Config {
     /// If unset, defaults to [`DEFAULT_MAX_DATACARRIER_BYTES`]. This size includes the OP_RETURN
     /// opcode and pushdata overhead. Matches zcashd's `-datacarriersize` default behavior.
     pub max_datacarrier_bytes: Option<u32>,
+
+    /// Independent limits for verified private transactions.
+    #[cfg(feature = "privacy-admission")]
+    pub private_pool: super::private_pool::PrivatePoolConfig,
 }
 
 impl Default for Config {
@@ -74,6 +78,9 @@ impl Default for Config {
             debug_enable_at_height: None,
 
             max_datacarrier_bytes: Some(DEFAULT_MAX_DATACARRIER_BYTES),
+
+            #[cfg(feature = "privacy-admission")]
+            private_pool: super::private_pool::PrivatePoolConfig::default(),
         }
     }
 }

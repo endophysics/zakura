@@ -83,7 +83,11 @@ default = ["default-release-binaries"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
-privacy-admission = ["zakura-node-services/privacy-admission"]
+privacy-admission = [
+    "dep:privacy-admission-core",
+    "zakura-node-services/privacy-admission",
+    "zakura-rpc/privacy-admission",
+]
 
 # Indexer support
 indexer = ["zakura-state/indexer", "zakura-rpc/indexer"]
@@ -176,6 +180,7 @@ zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0-rc0" }
 zakura-jsonl-trace = { path = "../zakura-jsonl-trace", version = "1.1.0" }
 zakura-network = { path = "../zakura-network", version = "7.0.0" }
 zakura-node-services = { path = "../zakura-node-services", version = "3.2.0", features = ["rpc-client"] }
+privacy-admission-core = { path = "../privacy-admission-core", version = "0.1.0", optional = true }
 zakura-rpc = { path = "../zakura-rpc", version = "8.0.0" }
 zakura-state = { path = "../zakura-state", version = "7.0.0" }
 # zakura-script is not used directly, but we list it here to enable the
