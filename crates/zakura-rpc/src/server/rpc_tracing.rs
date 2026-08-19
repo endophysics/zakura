@@ -20,6 +20,8 @@ use jsonrpsee::{
 };
 use tracing::{info_span, Instrument};
 
+use super::rpc_logger::per_call_observability_enabled;
+
 /// Middleware that creates SERVER spans for each RPC request.
 ///
 /// This enables Jaeger SPM by marking RPC endpoints as server-side handlers.
@@ -53,6 +55,11 @@ where
 
     fn call(&self, request: jsonrpsee::types::Request<'a>) -> Self::Future {
         let service = self.service.clone();
+
+        if !per_call_observability_enabled(request.method_name()) {
+            return ResponseFuture::future(Box::pin(async move { service.call(request).await }));
+        }
+
         let method = request.method_name().to_owned();
 
         // Create span OUTSIDE the async block so it's properly registered
