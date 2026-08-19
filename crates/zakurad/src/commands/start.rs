@@ -178,6 +178,10 @@ fn use_zakura_block_sync(config: &zakura_network::Config) -> bool {
 fn check_tcp_slow_start_after_idle() {}
 
 impl StartCmd {
+    #[cfg(feature = "privacy-admission")]
+    const PRIVATE_RELEASE_SCHEDULER_SHUTDOWN_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(5);
+
     /// Extra time Zebra waits for the zcashd-compat supervisor task beyond the
     /// child's `shutdown_grace_period`. The supervisor's `terminate_child` waits
     /// the full grace period before its SIGKILL last resort, so the outer wait
@@ -557,6 +561,9 @@ impl StartCmd {
         );
 
         info!("initializing mempool");
+        #[cfg(feature = "privacy-admission")]
+        let (private_scheduler_state_sender, private_scheduler_state_receiver) =
+            watch::channel(zakura_node_services::mempool::SchedulerState::Idle);
         let (mempool, mempool_transaction_subscriber) = Mempool::new(
             &config.mempool,
             config.network.expose_peer_addresses,
@@ -568,6 +575,14 @@ impl StartCmd {
             chain_tip_change.clone(),
             misbehavior_sender.clone(),
         );
+        #[cfg(feature = "privacy-admission")]
+        let mut mempool = mempool;
+        #[cfg(feature = "privacy-admission")]
+        mempool.set_private_scheduler_state(private_scheduler_state_receiver);
+        #[cfg(feature = "privacy-admission")]
+        let private_release_timing = mempool.private_release_timing();
+        #[cfg(feature = "privacy-admission")]
+        let private_lifecycle_control = mempool.private_lifecycle_control();
         let mempool = BoxService::new(mempool);
         let mempool = ServiceBuilder::new()
             .buffer(mempool::downloads::MAX_INBOUND_CONCURRENCY)
@@ -693,6 +708,19 @@ impl StartCmd {
 
         info!("spawning mempool queue checker task");
         let mempool_queue_checker_task_handle = mempool::QueueChecker::spawn(mempool.clone());
+
+        #[cfg(feature = "privacy-admission")]
+        let private_scheduler_shutdown = shutdown.child_token();
+        #[cfg(feature = "privacy-admission")]
+        let private_release_scheduler_task_handle = mempool::PrivateReleaseScheduler::spawn(
+            mempool.clone(),
+            private_release_timing,
+            private_scheduler_state_sender,
+            private_scheduler_shutdown.clone(),
+        );
+        #[cfg(not(feature = "privacy-admission"))]
+        let private_release_scheduler_task_handle =
+            std::future::pending::<Result<Result<(), crate::BoxError>, tokio::task::JoinError>>();
 
         info!("spawning mempool transaction gossip task");
         let tx_gossip_task_handle = tokio::spawn(
@@ -852,6 +880,7 @@ impl StartCmd {
         pin!(block_gossip_task_handle);
         pin!(mempool_crawler_task_handle);
         pin!(mempool_queue_checker_task_handle);
+        pin!(private_release_scheduler_task_handle);
         pin!(tx_gossip_task_handle);
         pin!(progress_task_handle);
         pin!(end_of_support_task_handle);
@@ -870,6 +899,8 @@ impl StartCmd {
 
         // Wait for tasks to finish
         let mut zcashd_compat_task_finished = false;
+        #[cfg(feature = "privacy-admission")]
+        let mut private_release_scheduler_task_finished = false;
         let exit_status = {
             let zcashd_compat_task_handle_fused = (&mut zcashd_compat_task_handle).fuse();
             pin!(zcashd_compat_task_handle_fused);
@@ -932,6 +963,17 @@ impl StartCmd {
                     .map(|_| info!("mempool queue checker task exited"))
                     .map_err(|e| eyre!(e)),
 
+                private_release_scheduler_result = &mut private_release_scheduler_task_handle => {
+                    #[cfg(feature = "privacy-admission")]
+                    {
+                    private_release_scheduler_task_finished = true;
+                    }
+                    private_release_scheduler_result
+                        .expect("unexpected panic in the private release scheduler")
+                        .map(|_| info!("private release scheduler task exited"))
+                        .map_err(|error| eyre!(error))
+                },
+
                 tx_gossip_result = &mut tx_gossip_task_handle => tx_gossip_result
                     .expect("unexpected panic in the transaction gossip task")
                     .map(|_| info!("transaction gossip task exited"))
@@ -992,8 +1034,44 @@ impl StartCmd {
                 }
             }
         };
+        #[cfg(feature = "privacy-admission")]
+        let mut exit_status = exit_status;
 
         info!("exiting Zakura: asking other tasks to stop");
+
+        #[cfg(feature = "privacy-admission")]
+        private_lifecycle_control.close();
+
+        #[cfg(feature = "privacy-admission")]
+        if !private_release_scheduler_task_finished {
+            private_scheduler_shutdown.cancel();
+            match tokio::time::timeout(
+                Self::PRIVATE_RELEASE_SCHEDULER_SHUTDOWN_TIMEOUT,
+                &mut private_release_scheduler_task_handle,
+            )
+            .await
+            {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    if exit_status.is_ok() {
+                        exit_status = Err(eyre!(error));
+                    }
+                }
+                Ok(Err(join_error)) => {
+                    if exit_status.is_ok() {
+                        exit_status = Err(eyre!(join_error));
+                    }
+                }
+                Err(_) => {
+                    warn!(
+                        shutdown_timeout = ?Self::PRIVATE_RELEASE_SCHEDULER_SHUTDOWN_TIMEOUT,
+                        "private release scheduler did not stop before the shutdown timeout"
+                    );
+                    private_release_scheduler_task_handle.abort();
+                    let _ = (&mut private_release_scheduler_task_handle).await;
+                }
+            }
+        }
 
         // ongoing tasks
         rpc_task_handle.abort();
