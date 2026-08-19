@@ -2,6 +2,8 @@
 
 #![allow(clippy::unwrap_in_result)]
 
+#[cfg(feature = "privacy-admission")]
+use std::io::Write;
 use std::{sync::Arc, time::Duration};
 
 use color_eyre::Report;
@@ -19,7 +21,9 @@ use zakura_chain::{
     transparent::{self, OutPoint},
 };
 use zakura_consensus::transaction as tx;
-use zakura_node_services::mempool::QueueSource;
+#[cfg(feature = "privacy-admission")]
+use zakura_node_services::mempool::{AdmissionContext, AdmissionId, AdmissionPolicy};
+use zakura_node_services::mempool::{AdmissionOrigin, QueueSource};
 use zakura_state::{Config as StateConfig, CHAIN_TIP_UPDATE_WAIT_LIMIT};
 use zakura_test::mock_service::{MockService, PanicAssertion};
 
@@ -36,6 +40,441 @@ type StateService = Buffer<BoxService<zs::Request, zs::Response, zs::BoxError>, 
 
 /// A [`MockService`] representing the Zebra transaction verifier service.
 type MockTxVerifier = MockService<tx::Request, tx::Response, PanicAssertion, TransactionError>;
+
+#[cfg(feature = "privacy-admission")]
+fn admission_context(id: u64) -> AdmissionContext {
+    AdmissionContext {
+        admission_id: AdmissionId(id),
+        policy: AdmissionPolicy::FixedEpoch,
+    }
+}
+
+#[cfg(feature = "privacy-admission")]
+#[tokio::test(flavor = "multi_thread")]
+async fn private_pending_duplicate_preserves_first_admission_identity() -> Result<(), Report> {
+    // Given: an enabled mempool and a private transaction pending verification.
+    let network = Network::Mainnet;
+    let transaction = network
+        .unmined_transactions_in_blocks(1..=1)
+        .next()
+        .expect("mainnet test vectors contain a transaction")
+        .transaction;
+    let tx_id = transaction.id();
+    let first_context = admission_context(7);
+    let conflicting_context = admission_context(8);
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        _tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+
+    // When: the same transaction is submitted with the same and then a conflicting identity.
+    let first_response = mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::QueuePrivate {
+            transaction: transaction.clone(),
+            context: first_context,
+        })
+        .await
+        .expect("private transaction is queued");
+    let same_response = mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::QueuePrivate {
+            transaction: transaction.clone(),
+            context: first_context,
+        })
+        .await
+        .expect("private duplicate returns a queue response");
+    let conflicting_response = mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::QueuePrivate {
+            transaction,
+            context: conflicting_context,
+        })
+        .await
+        .expect("conflicting private duplicate returns a queue response");
+
+    // Then: the first context remains canonical and duplicates report typed errors.
+    assert!(
+        matches!(first_response, Response::Queued(results) if results.len() == 1 && results[0].is_ok())
+    );
+    assert!(matches!(
+        mempool.tx_downloads().transaction_requests().next().map(|request| request.origin()),
+        Some(AdmissionOrigin::PrivateLocal(context)) if *context == first_context
+    ));
+    let Response::Queued(mut same_results) = same_response else {
+        panic!("private queue should return queue results");
+    };
+    assert!(matches!(
+        same_results.remove(0).unbox_mempool_error(),
+        MempoolError::AlreadyQueued
+    ));
+    let Response::Queued(mut conflicting_results) = conflicting_response else {
+        panic!("private queue should return queue results");
+    };
+    assert!(matches!(
+        conflicting_results.remove(0).unbox_mempool_error(),
+        MempoolError::ConflictingPrivateAdmission
+    ));
+    assert_eq!(mempool.tx_downloads().transaction_requests().count(), 1);
+    assert_eq!(
+        mempool
+            .tx_downloads()
+            .transaction_requests()
+            .next()
+            .unwrap()
+            .gossip()
+            .id(),
+        tx_id
+    );
+
+    Ok(())
+}
+
+#[cfg(feature = "privacy-admission")]
+#[tokio::test]
+async fn disabled_private_queue_returns_one_disabled_result() -> Result<(), Report> {
+    // Given: a disabled mempool and a private transaction.
+    let network = Network::Mainnet;
+    let transaction = network
+        .unmined_transactions_in_blocks(1..=1)
+        .next()
+        .expect("mainnet test vectors contain a transaction")
+        .transaction;
+    let (mut mempool, ..) = setup(&network, u64::MAX, true).await;
+
+    // When: the private request is submitted while disabled.
+    let response = mempool
+        .ready()
+        .await
+        .expect("disabled mempool service becomes ready")
+        .call(Request::QueuePrivate {
+            transaction,
+            context: admission_context(7),
+        })
+        .await
+        .expect("disabled private queue returns a response");
+
+    // Then: it returns exactly one disabled queue result.
+    let Response::Queued(mut results) = response else {
+        panic!("private queue should return queue results");
+    };
+    assert_eq!(results.len(), 1);
+    assert!(matches!(
+        results.remove(0).unbox_mempool_error(),
+        MempoolError::Disabled
+    ));
+
+    Ok(())
+}
+
+#[cfg(feature = "privacy-admission")]
+#[tokio::test(flavor = "multi_thread")]
+async fn inspect_private_context() -> Result<(), Report> {
+    // Given: an enabled mempool and a private transaction accepted by the verifier.
+    let network = Network::Mainnet;
+    let verified_transaction = network
+        .unmined_transactions_in_blocks(1..=1)
+        .next()
+        .expect("mainnet test vectors contain a transaction");
+    let transaction = verified_transaction.transaction.clone();
+    let tx_id = transaction.id();
+    let context = admission_context(7);
+    let (
+        mut mempool,
+        _peer_set,
+        _state_service,
+        _chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        mut mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, true).await;
+    mempool.enable(&mut recent_syncs).await;
+
+    // When: private verification completes and poll_ready inserts the transaction.
+    let queue = mempool
+        .ready()
+        .await
+        .expect("mempool is ready")
+        .call(Request::QueuePrivate {
+            transaction,
+            context,
+        });
+    let verify = tx_verifier.expect_request_that(|_| true).map(|responder| {
+        responder.respond(transaction::Response::Mempool {
+            transaction: verified_transaction,
+            spent_mempool_outpoints: Vec::new(),
+        });
+    });
+    let (response, _) = futures::join!(queue, verify);
+    let Response::Queued(mut results) = response.expect("private queue returns a response") else {
+        panic!("private queue should return queue results");
+    };
+    let mut result = results.remove(0).expect("private verification is queued");
+    let insertion_result = timeout(Duration::from_secs(3), async {
+        loop {
+            mempool.dummy_call().await;
+            match result.try_recv() {
+                Ok(result) => break result,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    tokio::task::yield_now().await;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    panic!("private result channel closed before insertion")
+                }
+            }
+        }
+    })
+    .await
+    .expect("private insertion completes");
+
+    // Then: ordinary insertion and gossip occur while the side map retains identity.
+    insertion_result.expect("private transaction is inserted");
+    assert_eq!(mempool.storage().transaction_count(), 1);
+    assert_eq!(mempool.private_admission_context(&tx_id), Some(context));
+    assert!(matches!(
+        mempool
+            .active_state
+            .transaction_retry_requests()
+            .into_iter()
+            .next()
+            .map(|request| request.origin().clone()),
+        Some(AdmissionOrigin::PrivateLocal(retry_context)) if retry_context == context
+    ));
+    assert_eq!(
+        timeout(Duration::from_secs(3), mempool_transaction_receiver.recv())
+            .await
+            .expect("ordinary gossip notification is timely")
+            .expect("ordinary gossip notification is sent"),
+        MempoolChange::added(HashSet::from([tx_id]))
+    );
+
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "origin=private-local")?;
+    writeln!(stdout, "policy=fixed-epoch")?;
+    writeln!(stdout, "verification=accepted")?;
+    writeln!(stdout, "current_behavior=ordinary-public-insertion")?;
+
+    Ok(())
+}
+
+#[cfg(feature = "privacy-admission")]
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_height_requeue_preserves_private_context_and_normalizes_peer_origin(
+) -> Result<(), Report> {
+    // Given: private and peer transactions that finish verification at the genesis height.
+    let network = nu_activation_test_network();
+    let blocks = generate_test_chain(&network, NU5_ACTIVATION_TEST_HEIGHT as usize + 3);
+    let grow_block = blocks[NU5_ACTIVATION_TEST_HEIGHT as usize].clone();
+    let private_transaction: zakura_chain::transaction::UnminedTx = blocks
+        .last()
+        .expect("generated chain is non-empty")
+        .transactions[0]
+        .clone()
+        .into();
+    let private_id = private_transaction.id();
+    let peer_transaction: zakura_chain::transaction::UnminedTx = blocks
+        .iter()
+        .rev()
+        .nth(1)
+        .expect("generated chain contains two uncommitted blocks")
+        .transactions[0]
+        .clone()
+        .into();
+    let peer_id = peer_transaction.id();
+    let context = admission_context(41);
+    let (
+        mut mempool,
+        _peer_set,
+        mut state_service,
+        mut chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, false).await;
+    for block in &blocks[..NU5_ACTIVATION_TEST_HEIGHT as usize] {
+        commit_block_and_wait_for_tip_change(
+            &mut state_service,
+            &mut chain_tip_change,
+            block.clone(),
+        )
+        .await;
+    }
+    mempool.enable(&mut recent_syncs).await;
+    mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::QueuePrivate {
+            transaction: private_transaction,
+            context,
+        })
+        .await
+        .expect("private transaction is queued");
+    mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::QueueFromPeer {
+            transactions: vec![Gossip::Tx(peer_transaction)],
+            source: QueueSource::Zakura(vec![9; 32]),
+        })
+        .await
+        .expect("peer transaction is queued");
+    for _ in 0..2 {
+        tx_verifier
+            .expect_request_that(|_| true)
+            .map(|responder| {
+                let requested_transaction = responder
+                    .request()
+                    .clone()
+                    .mempool_transaction()
+                    .expect("verifier request is for the mempool");
+                let requested_id = requested_transaction.id();
+                responder.respond(transaction::Response::Mempool {
+                    transaction: VerifiedUnminedTx::new(
+                        requested_transaction,
+                        Amount::try_from(1_000_000).expect("valid test fee"),
+                        0,
+                        0,
+                        Arc::new(Vec::new()),
+                    )
+                    .expect("mock verification succeeds"),
+                    spent_mempool_outpoints: Vec::new(),
+                });
+                assert!(requested_id == private_id || requested_id == peer_id);
+            })
+            .await;
+    }
+
+    // When: block one grows the tip before poll_ready consumes the completed verifications.
+    commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, grow_block)
+        .await;
+
+    // Then: actual full-transaction retries retain only private identity.
+    let retry_responders = timeout(Duration::from_secs(3), async {
+        let observe_retries = async {
+            let mut responders = Vec::new();
+            for _ in 0..2 {
+                responders.push(tx_verifier.expect_request_that(|_| true).await);
+            }
+            responders
+        };
+        let drive_mempool = async {
+            loop {
+                mempool.dummy_call().await;
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            responders = observe_retries => responders,
+            () = drive_mempool => unreachable!("mempool driver does not finish"),
+        }
+    })
+    .await
+    .expect("stale-height completions reach a second verification");
+    let pending = mempool
+        .tx_downloads()
+        .transaction_requests()
+        .map(|request| (request.gossip().id(), request.origin().clone()))
+        .collect::<HashMap<_, _>>();
+    assert_eq!(
+        pending.get(&private_id),
+        Some(&AdmissionOrigin::PrivateLocal(context))
+    );
+    assert_eq!(pending.get(&peer_id), Some(&AdmissionOrigin::LegacyLocal));
+    for responder in retry_responders {
+        responder.respond(Err(TransactionError::BadBalance));
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "privacy-admission")]
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_requeue_preserves_private_context_on_actual_pending_record() -> Result<(), Report> {
+    // Given: a private verification pending immediately before a network-upgrade reset.
+    let network = nu_activation_test_network();
+    let blocks = generate_test_chain(&network, NU5_ACTIVATION_TEST_HEIGHT as usize + 2);
+    let reset_block = blocks[NU5_ACTIVATION_TEST_HEIGHT as usize - 1].clone();
+    let transaction: zakura_chain::transaction::UnminedTx = blocks
+        .last()
+        .expect("generated chain is non-empty")
+        .transactions[0]
+        .clone()
+        .into();
+    let transaction_id = transaction.id();
+    let context = admission_context(42);
+    let (
+        mut mempool,
+        _peer_set,
+        mut state_service,
+        mut chain_tip_change,
+        mut tx_verifier,
+        mut recent_syncs,
+        _mempool_transaction_receiver,
+    ) = setup(&network, u64::MAX, false).await;
+    for block in &blocks[..NU5_ACTIVATION_TEST_HEIGHT as usize - 1] {
+        commit_block_and_wait_for_tip_change(
+            &mut state_service,
+            &mut chain_tip_change,
+            block.clone(),
+        )
+        .await;
+    }
+    mempool.enable(&mut recent_syncs).await;
+    mempool
+        .ready()
+        .await
+        .expect("mempool service becomes ready")
+        .call(Request::QueuePrivate {
+            transaction,
+            context,
+        })
+        .await
+        .expect("private transaction is queued");
+    let initial_verification = tx_verifier.expect_request_that(|_| true).await;
+
+    // When: the reset drops the old downloader and requeues its pending transaction.
+    commit_block_and_wait_for_tip_change(&mut state_service, &mut chain_tip_change, reset_block)
+        .await;
+    mempool.dummy_call().await;
+    initial_verification.respond(Err(TransactionError::BadBalance));
+
+    // Then: the actual replacement task carries the same private identity and full transaction.
+    let pending = mempool
+        .tx_downloads()
+        .transaction_requests()
+        .find(|request| request.gossip().id() == transaction_id)
+        .expect("reset requeued the private transaction");
+    assert_eq!(pending.origin(), &AdmissionOrigin::PrivateLocal(context));
+    assert!(matches!(pending.gossip(), Gossip::Tx(_)));
+    let retry_verification = timeout(
+        Duration::from_secs(3),
+        tx_verifier.expect_request_that(move |request| {
+            request
+                .clone()
+                .mempool_transaction()
+                .is_some_and(|transaction| transaction.id() == transaction_id)
+        }),
+    )
+    .await
+    .expect("reset retry reached the verifier");
+    retry_verification.respond(Err(TransactionError::BadBalance));
+
+    Ok(())
+}
 
 #[test]
 fn policy_rejection_has_no_misbehavior_score() {
@@ -2764,12 +3203,12 @@ async fn setup_with_mempool_config_and_misbehavior_sender(
 ///
 /// Before the fix, when the outer `tokio::time::timeout(RATE_LIMIT_DELAY, ..)`
 /// wrapping mempool tx verification fired, `Downloads::poll_next` propagated
-/// the `Elapsed` error without dropping the corresponding `cancel_handles`
+/// the `Elapsed` error without dropping the corresponding pending transaction
 /// entry. Each retained entry held a full `Gossip::Tx(UnminedTx)`, was never
 /// garbage-collected (since `cancel(mined_ids)` only matches mined txids),
 /// and the structure grew without bound under sustained adversarial input.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn cancel_handles_drained_after_verification_timeout() {
+async fn pending_transactions_drained_after_verification_timeout() {
     use futures::stream::StreamExt;
     use tower::timeout::Timeout;
     use zakura_node_services::mempool::Gossip;
@@ -2801,15 +3240,24 @@ async fn cancel_handles_drained_after_verification_timeout() {
 
     downloads
         .as_mut()
-        .download_if_needed_and_verify(Gossip::Tx(v1), None, None)
+        .download_if_needed_and_verify(
+            downloads::PendingTransaction::new(Gossip::Tx(v1), AdmissionOrigin::LegacyLocal),
+            None,
+        )
         .expect("queue tx 1");
     downloads
         .as_mut()
-        .download_if_needed_and_verify(Gossip::Tx(v2), None, None)
+        .download_if_needed_and_verify(
+            downloads::PendingTransaction::new(Gossip::Tx(v2), AdmissionOrigin::LegacyLocal),
+            None,
+        )
         .expect("queue tx 2");
     downloads
         .as_mut()
-        .download_if_needed_and_verify(Gossip::Tx(v3), None, None)
+        .download_if_needed_and_verify(
+            downloads::PendingTransaction::new(Gossip::Tx(v3), AdmissionOrigin::LegacyLocal),
+            None,
+        )
         .expect("queue tx 3");
 
     assert_eq!(downloads.in_flight(), 3);
@@ -2842,6 +3290,6 @@ async fn cancel_handles_drained_after_verification_timeout() {
     let leaked = downloads.transaction_requests().count();
     assert_eq!(
         leaked, 0,
-        "regression GHSA-65jj-fmw8-468q: cancel_handles must be drained after timeout"
+        "regression GHSA-65jj-fmw8-468q: pending transactions must be drained after timeout"
     );
 }

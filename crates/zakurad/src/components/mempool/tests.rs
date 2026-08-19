@@ -20,6 +20,11 @@ use zakura_chain::{
 };
 use zakura_node_services::mempool::QueueSource;
 
+#[cfg(feature = "privacy-admission")]
+use zakura_chain::transaction::UnminedTxId;
+#[cfg(feature = "privacy-admission")]
+use zakura_node_services::mempool::AdmissionContext;
+
 mod prop;
 mod vector;
 
@@ -69,6 +74,17 @@ impl Mempool {
         match &self.active_state {
             ActiveState::Disabled => panic!("mempool must be enabled"),
             ActiveState::Enabled { tx_downloads, .. } => tx_downloads,
+        }
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    pub fn private_admission_context(&self, tx_id: &UnminedTxId) -> Option<AdmissionContext> {
+        match &self.active_state {
+            ActiveState::Disabled => None,
+            ActiveState::Enabled {
+                private_admission_contexts,
+                ..
+            } => private_admission_contexts.get(tx_id).copied(),
         }
     }
 
