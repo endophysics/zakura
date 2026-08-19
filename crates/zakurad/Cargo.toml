@@ -83,6 +83,8 @@ default = ["default-release-binaries"]
 
 # Production features that activate extra dependencies, or extra features in dependencies
 
+privacy-admission = ["zakura-node-services/privacy-admission"]
+
 # Indexer support
 indexer = ["zakura-state/indexer", "zakura-rpc/indexer"]
 

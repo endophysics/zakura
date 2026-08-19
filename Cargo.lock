@@ -8553,6 +8553,7 @@ version = "3.2.1"
 dependencies = [
  "color-eyre",
  "jsonrpsee-types",
+ "privacy-admission-core",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

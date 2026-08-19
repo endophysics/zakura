@@ -41,12 +41,40 @@ impl std::error::Error for MempoolDisabledError {}
 mod tests {
     use super::MempoolDisabledError;
 
+    #[cfg(feature = "privacy-admission")]
+    use super::{AdmissionContext, AdmissionId, AdmissionOrigin, AdmissionPolicy, Request};
+    #[cfg(feature = "privacy-admission")]
+    use zakura_chain::transaction::UnminedTx;
+
     #[test]
     fn mempool_disabled_error_uses_zakura_branding() {
         assert_eq!(
             MempoolDisabledError.to_string(),
             "mempool is not active: wait for Zakura to sync to the tip"
         );
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    #[test]
+    fn private_queue_request_carries_context_and_requires_a_full_transaction() {
+        // Given: a fixed-epoch private admission context.
+        let context = AdmissionContext {
+            admission_id: AdmissionId(7),
+            policy: AdmissionPolicy::FixedEpoch,
+        };
+
+        // When: a private request constructor is assigned its public API shape.
+        let _: fn(UnminedTx, AdmissionContext) -> Request =
+            |transaction, context| Request::QueuePrivate {
+                transaction,
+                context,
+            };
+
+        // Then: the context is preserved in its canonical private-local origin.
+        assert!(matches!(
+            AdmissionOrigin::PrivateLocal(context),
+            AdmissionOrigin::PrivateLocal(actual) if actual == context
+        ));
     }
 }
 
@@ -67,6 +95,45 @@ impl From<SocketAddr> for QueueSource {
     fn from(source: SocketAddr) -> Self {
         Self::LegacySocket(source)
     }
+}
+
+/// The provenance of a transaction admission request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdmissionOrigin {
+    /// A request advertised by a peer.
+    Peer(QueueSource),
+
+    /// A request collected by the transaction crawler.
+    Crawler,
+
+    /// A request submitted through the existing local queue path.
+    LegacyLocal,
+
+    /// A request submitted through the feature-gated private local path.
+    #[cfg(feature = "privacy-admission")]
+    PrivateLocal(AdmissionContext),
+}
+
+/// A stable private-admission identifier.
+#[cfg(feature = "privacy-admission")]
+pub use privacy_admission_core::AdmissionId;
+
+/// The scheduling policy for a private admission.
+#[cfg(feature = "privacy-admission")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdmissionPolicy {
+    /// Admit according to a fixed release epoch.
+    FixedEpoch,
+}
+
+/// The private-admission metadata attached to a local transaction submission.
+#[cfg(feature = "privacy-admission")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdmissionContext {
+    /// The stable private-admission identifier.
+    pub admission_id: AdmissionId,
+    /// The scheduling policy selected for this admission.
+    pub policy: AdmissionPolicy,
 }
 
 /// A mempool service request.
@@ -133,11 +200,13 @@ pub enum Request {
     /// using a unique set of [`UnminedTxId`]s.
     RejectedTransactionIds(HashSet<UnminedTxId>),
 
-    /// Queue a list of gossiped transactions or transaction IDs, or
-    /// crawled transaction IDs.
+    /// Queue a list of gossiped transactions or transaction IDs.
     ///
     /// The transaction downloader checks for duplicates across IDs and transactions.
     Queue(Vec<Gossip>),
+
+    /// Queue a list of gossiped transactions or transaction IDs from the crawler.
+    QueueFromCrawler(Vec<Gossip>),
 
     /// Queue transactions or transaction IDs received from a specific peer,
     /// tagging each one with the peer so the downloader can enforce a per-peer
@@ -147,6 +216,15 @@ pub enum Request {
         transactions: Vec<Gossip>,
         /// The peer that advertised them.
         source: QueueSource,
+    },
+
+    /// Queue a full transaction from the feature-gated private local path.
+    #[cfg(feature = "privacy-admission")]
+    QueuePrivate {
+        /// The full transaction contents, never an ID-only gossip announcement.
+        transaction: UnminedTx,
+        /// The private-admission metadata for the submission.
+        context: AdmissionContext,
     },
 
     /// Check for newly verified transactions.

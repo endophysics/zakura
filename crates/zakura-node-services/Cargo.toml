@@ -19,6 +19,7 @@ categories = ["asynchronous", "cryptography::cryptocurrencies", "network-program
 default = []
 
 # Production features that activate extra dependencies, or extra features in dependencies
+privacy-admission = ["dep:privacy-admission-core"]
 
 # Tool and test features
 
@@ -36,6 +37,8 @@ zakura-header-chain = { path = "../zakura-header-chain", version = "1.0.0-rc0" }
 tower = { workspace = true }
 
 # Optional dependencies
+
+privacy-admission-core = { path = "../privacy-admission-core", version = "0.1.0", optional = true }
 
 # Tool and test feature rpc-client
 color-eyre = { workspace = true, optional = true }
