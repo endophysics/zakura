@@ -178,10 +178,6 @@ fn use_zakura_block_sync(config: &zakura_network::Config) -> bool {
 fn check_tcp_slow_start_after_idle() {}
 
 impl StartCmd {
-    #[cfg(feature = "privacy-admission")]
-    const PRIVATE_RELEASE_SCHEDULER_SHUTDOWN_TIMEOUT: std::time::Duration =
-        std::time::Duration::from_secs(5);
-
     /// Extra time Zebra waits for the zcashd-compat supervisor task beyond the
     /// child's `shutdown_grace_period`. The supervisor's `terminate_child` waits
     /// the full grace period before its SIGKILL last resort, so the outer wait
@@ -212,6 +208,20 @@ impl StartCmd {
             return Err(eyre!(
                 "sync.debug_blocksync_throughput_target_height={target_height} exceeds the maximum supported block height {}",
                 block::Height::MAX.0
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    fn validate_private_rpc_config(config: &ZakuradConfig) -> Result<(), Report> {
+        if config.rpc.listen_addr.is_some()
+            && !config.rpc.enable_cookie_auth
+            && !config.network.network.is_regtest()
+        {
+            return Err(eyre!(
+                "private admission requires rpc.enable_cookie_auth = true outside regtest"
             ));
         }
 
@@ -327,6 +337,8 @@ impl StartCmd {
 
         Self::validate_consensus_config(&config)?;
         Self::validate_debug_blocksync_throughput_config(&config)?;
+        #[cfg(feature = "privacy-admission")]
+        Self::validate_private_rpc_config(&config)?;
 
         if config.zcashd_compat.enabled {
             zcashd_compat::run_preflight(&config, self.unsafe_low_specs)?;
@@ -1044,12 +1056,10 @@ impl StartCmd {
 
         #[cfg(feature = "privacy-admission")]
         if !private_release_scheduler_task_finished {
+            let shutdown_timeout = std::time::Duration::from_secs(5);
             private_scheduler_shutdown.cancel();
-            match tokio::time::timeout(
-                Self::PRIVATE_RELEASE_SCHEDULER_SHUTDOWN_TIMEOUT,
-                &mut private_release_scheduler_task_handle,
-            )
-            .await
+            match tokio::time::timeout(shutdown_timeout, &mut private_release_scheduler_task_handle)
+                .await
             {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(error))) => {
@@ -1064,7 +1074,7 @@ impl StartCmd {
                 }
                 Err(_) => {
                     warn!(
-                        shutdown_timeout = ?Self::PRIVATE_RELEASE_SCHEDULER_SHUTDOWN_TIMEOUT,
+                        ?shutdown_timeout,
                         "private release scheduler did not stop before the shutdown timeout"
                     );
                     private_release_scheduler_task_handle.abort();
@@ -1260,6 +1270,9 @@ impl config::Override<ZakuradConfig> for StartCmd {
             .map_err(|err| std::io::Error::other(err.to_string()))?;
         Self::validate_debug_blocksync_throughput_config(&config)
             .map_err(|err| std::io::Error::other(err.to_string()))?;
+        #[cfg(feature = "privacy-admission")]
+        Self::validate_private_rpc_config(&config)
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
 
         Ok(config)
     }
@@ -1351,6 +1364,55 @@ mod tests {
             ),
             "unexpected error: {error}"
         );
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    #[test]
+    fn private_rpc_requires_cookie_auth_outside_regtest() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZakuradConfig::default();
+        config.rpc.listen_addr = Some(
+            "127.0.0.1:8232"
+                .parse()
+                .expect("the test RPC address is valid"),
+        );
+        config.rpc.enable_cookie_auth = false;
+
+        let error = cmd
+            .override_config(config)
+            .expect_err("private admission must not use an unauthenticated production RPC");
+
+        assert!(
+            error.to_string().contains(
+                "private admission requires rpc.enable_cookie_auth = true outside regtest"
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(feature = "privacy-admission")]
+    #[test]
+    fn private_rpc_allows_unauthenticated_regtest_inspection() {
+        let cmd = StartCmd {
+            filters: Vec::new(),
+            zcashd_compat: false,
+            unsafe_low_specs: false,
+        };
+        let mut config = ZakuradConfig::default();
+        config.network.network = zakura_chain::parameters::Network::new_regtest(Default::default());
+        config.rpc.listen_addr = Some(
+            "127.0.0.1:8232"
+                .parse()
+                .expect("the test RPC address is valid"),
+        );
+        config.rpc.enable_cookie_auth = false;
+
+        cmd.override_config(config)
+            .expect("regtest inspection may use its isolated unauthenticated RPC");
     }
 
     #[test]
