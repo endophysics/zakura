@@ -39,6 +39,9 @@ use crate::{
 mod prop;
 
 #[cfg(test)]
+mod transaction_broadcast;
+
+#[cfg(test)]
 mod vectors;
 
 /// The maximum number of arbitrary peers to generate in [`PeerVersions`].

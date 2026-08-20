@@ -400,7 +400,7 @@ fn sidecar_peer_always_receives_block_gossip() {
 /// This will poll the `peer_set` to allow it to drop outdated peers, and then check the peer
 /// `harnesses` to assert that only up-to-date peers are kept by the `peer_set`.
 /// Returns the number of up-to-date peers on success.
-fn check_if_only_up_to_date_peers_are_live<D, C>(
+pub(super) fn check_if_only_up_to_date_peers_are_live<D, C>(
     peer_set: &mut PeerSet<D, C>,
     harnesses: &mut Vec<ClientTestHarness>,
     minimum_version: Version,
