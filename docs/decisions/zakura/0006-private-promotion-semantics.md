@@ -8,7 +8,7 @@ builds-on: [Admission and release core scheduling and crate boundary](0003-admis
 
 ## Context and Problem Statement
 
-[WP04](../../../../agent_packages/packages/WP04-zakura-private-pool.md) must move due transactions from the private pool into Zakura's unchanged public insertion and gossip path. ADR 0003 makes a due batch atomic in the admission core, while ADR 0004 preserves admission identity through retries and chain-tip changes. The node integration must extend that atomicity across public promotion and define which failures consume private state.
+Due transactions must move from the private pool into Zakura's unchanged public insertion and gossip path. ADR 0003 makes a due batch atomic in the admission core, while ADR 0004 preserves admission identity through retries and chain-tip changes. The node integration must extend that atomicity across public promotion and define which failures consume private state.
 
 ## Priorities & Constraints
 

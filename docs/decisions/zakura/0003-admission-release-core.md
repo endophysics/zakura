@@ -7,7 +7,7 @@ date: 2026-08-18
 
 ## Context and Problem Statement
 
-WP02 needs a deterministic admission and release state machine that can be reviewed and tested without a running Zakura node. It must define time, retries, deadlines, terminal states, and due batches without taking ownership of transaction data or node integration.
+The private-admission path needs a deterministic admission and release state machine that can be reviewed and tested without a running Zakura node. It must define time, retries, deadlines, terminal states, and due batches without taking ownership of transaction data or node integration.
 
 ## Priorities & Constraints
 
@@ -21,11 +21,11 @@ WP02 needs a deterministic admission and release state machine that can be revie
 - Fixed epochs: group releases at configured epoch boundaries.
 - Rolling pools: form release groups from a moving window or pool.
 
-Fixed epochs have a smaller state and timing surface, make boundary cases reproducible, and produce deterministic batches from the same admissions and clock observations. Rolling pools may improve later traffic-shaping behavior, but add pool membership and window policy that WP02 does not need.
+Fixed epochs have a smaller state and timing surface, make boundary cases reproducible, and produce deterministic batches from the same admissions and clock observations. Rolling pools may improve later traffic-shaping behavior, but add pool membership and window policy that the initial implementation does not need.
 
 ## Decision Outcome
 
-Use a synchronous, node-independent admission core with fixed-epoch scheduling. Rolling pools are deferred to WP14.
+Use a synchronous, node-independent admission core with fixed-epoch scheduling. Rolling pools are deferred.
 
 Acceptance is an event, not a durable `Accepted` state. A successful acceptance records the original acceptance time and moves the admission to `Embargoed`. After its embargo and release deadline are satisfied, it becomes `Eligible`; a due batch moves it to `Released`. Policy actions may instead move it to `Rejected` or `Removed`. `Released`, `Rejected`, and `Removed` are absorbing terminal states.
 
@@ -45,5 +45,5 @@ At each accepted clock observation, all due admissions form an atomic batch with
 
 - Tests can reproduce admission, embargo, eligibility, batching, rejection, removal, retries, epoch boundaries, maximum-delay caps, and clock rollback without node services.
 - Implementations can be reviewed against one precise state machine and deadline formula.
-- Fixed epochs provide deterministic initial behavior while leaving rolling-pool policy to WP14.
-- The core does not own storage; transaction representation or parsing; consensus or mempool-policy verification; mempool or P2P integration; OHTTP; TEE support; wallet behavior; WP03 node plumbing; or delivery and persistence guarantees.
+- Fixed epochs provide deterministic initial behavior while deferring rolling-pool policy.
+- The core does not own storage; transaction representation or parsing; consensus or mempool-policy verification; mempool or P2P integration; OHTTP; TEE support; wallet behavior; node plumbing; or delivery and persistence guarantees.
