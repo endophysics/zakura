@@ -113,9 +113,19 @@ impl PrivatePoolConfig {
         self.release_policy
     }
 
-    #[cfg(test)]
-    pub(crate) const fn release_epoch(self) -> Duration {
+    /// Return the configured fixed release epoch.
+    pub const fn release_epoch(self) -> Duration {
         self.release_epoch
+    }
+
+    /// Return the configured minimum release delay.
+    pub const fn minimum_release_delay(self) -> Duration {
+        self.minimum_release_delay
+    }
+
+    /// Return the configured maximum release delay.
+    pub const fn maximum_release_delay(self) -> Duration {
+        self.maximum_release_delay
     }
 }
 

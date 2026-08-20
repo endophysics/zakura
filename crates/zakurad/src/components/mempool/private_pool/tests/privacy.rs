@@ -71,6 +71,18 @@ fn zero_limits_fail_configuration_deserialization() {
 }
 
 #[test]
+fn unknown_fields_fail_configuration_deserialization() {
+    // Given: an otherwise valid config containing non-policy metadata.
+    let unknown = r#"{"max_transactions":1,"build_commit":"sentinel"}"#;
+
+    // When: the config crosses the serde boundary.
+    let result = serde_json::from_str::<PrivatePoolConfig>(unknown);
+
+    // Then: metadata outside the private-pool schema is rejected.
+    assert!(result.is_err());
+}
+
+#[test]
 fn invalid_release_durations_fail_configuration_deserialization() {
     // Given: zero and inverted private release durations.
     let zero_epoch = r#"{"release_epoch":"0s"}"#;
