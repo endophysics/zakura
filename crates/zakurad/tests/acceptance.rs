@@ -4737,7 +4737,7 @@ async fn zcashd_compat_transparent_tx_in_mempool() -> Result<()> {
 #[tokio::test]
 #[ignore = "human inspection of real private admission and scheduled P2P release"]
 async fn zcashd_compat_inspect_private_release() -> Result<()> {
-    common::zcashd_compat::tx_flow::inspect_private_release().await
+    common::zcashd_compat::private_release_inspection::inspect_private_release().await
 }
 
 /// Rejects a transaction above Zakura's mempool size limit, then accepts it in a block.
