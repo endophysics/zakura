@@ -35,7 +35,7 @@ zcashd-compat implementation or test harness — see
 
 ### Private-release inspection
 
-On a host that supports the managed zcashd test setup, run the WP05 inspection
+On a host that supports the managed zcashd test setup, run the private-release inspection
 with:
 
 ```console

@@ -70,7 +70,7 @@ Hash the complete byte sequence once with SHA-256 and display the 32-byte digest
 
 The projection excludes commits, upstream revisions, build timestamps, node or peer IDs, transaction or admission IDs, runtime transaction counts, runtime byte counts, process timestamps, and all other build or runtime metadata. Its constructor has no API parameter through which those values can enter.
 
-This digest is an operator inspection fingerprint, not a consensus commitment, network protocol field, cross-stack configuration schema, compatibility promise for generic configuration serialization, or authentication mechanism. This corrected shape remains policy version 1 because the earlier shape was unreleased within the same implementation cycle. After version 1 is released, a change to the canonical bytes requires a new policy version and updated test vector.
+This digest is an operator inspection fingerprint, not a consensus commitment, network protocol field, cross-stack configuration schema, compatibility promise for generic configuration serialization, or authentication mechanism. After version 1 is released, a change to the canonical bytes requires a new policy version and updated test vector.
 
 ## Expected Consequences
 
