@@ -240,6 +240,8 @@ mod tests {
 
     use super::*;
 
+    mod origin_independence;
+
     fn test_tx_ids(count: usize, seed: u8) -> HashSet<UnminedTxId> {
         (0..count)
             .map(|index| {
