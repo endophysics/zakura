@@ -372,6 +372,44 @@ impl StartCmd {
             .validate_storage_mode(&config.network.network)
             .map_err(|error| eyre!("invalid state storage configuration: {error}"))?;
 
+        #[cfg(feature = "privacy-admission")]
+        let operator_privacy_policy = mempool::operator_policy::OperatorPrivacyPolicy::new(
+            config.mempool.private_pool,
+            config.network.max_connections_per_ip,
+            config.network.peerset_initial_target_size,
+        )?
+        .summary();
+
+        info!(
+            event = "build_identity",
+            version = %build_version(),
+            user_agent = %user_agent(),
+            "build identity"
+        );
+
+        #[cfg(feature = "privacy-admission")]
+        info!(
+            event = "operator_privacy_policy",
+            policy_version = operator_privacy_policy.policy_version,
+            policy_hash = operator_privacy_policy.policy_hash.as_str(),
+            max_private_transactions = operator_privacy_policy.max_private_transactions,
+            max_private_serialized_bytes = operator_privacy_policy.max_private_serialized_bytes,
+            release_timing = operator_privacy_policy.release_timing,
+            release_epoch_seconds = operator_privacy_policy.release_epoch_seconds,
+            release_epoch_nanoseconds = operator_privacy_policy.release_epoch_nanoseconds,
+            minimum_release_delay_seconds = operator_privacy_policy.minimum_release_delay_seconds,
+            minimum_release_delay_nanoseconds =
+                operator_privacy_policy.minimum_release_delay_nanoseconds,
+            maximum_release_delay_seconds = operator_privacy_policy.maximum_release_delay_seconds,
+            maximum_release_delay_nanoseconds =
+                operator_privacy_policy.maximum_release_delay_nanoseconds,
+            egress = operator_privacy_policy.egress,
+            peer_diversity = operator_privacy_policy.peer_diversity,
+            max_connections_per_ip = operator_privacy_policy.max_connections_per_ip,
+            peerset_initial_target_size = operator_privacy_policy.peerset_initial_target_size,
+            "operator privacy policy active"
+        );
+
         let (_, max_checkpoint_height) = zakura_consensus::router::init_checkpoint_list(
             config.consensus.clone(),
             &config.network.network,
