@@ -195,7 +195,7 @@ error (misconfiguration, not a skip).
 | `zcashd_compat_getwalletinfo_fields_present` | wallet | Full check | Full check |
 | `zcashd_compat_transparent_tx_in_mempool` | tx_flow | Mines 200, sends tx, polls zakurad mempool | Validates `getmempoolinfo` structure only |
 | `zcashd_compat_transparent_tx_confirms` | tx_flow | Sends + mines + checks confirmations on both sides | **Skipped** |
-| `zcashd_compat_inspect_private_release` | tx_flow | Managed identifier-free private-release inspection (`privacy-admission`) | **Skipped** |
+| `zcashd_compat_inspect_private_release` | private_release_inspection | Managed identifier-free private-release inspection (`privacy-admission`) | **Skipped** |
 | `zcashd_compat_zakurad_clean_shutdown` | resilience | Mines 3, SIGKILLs zakurad, asserts clean exit | **Skipped** (don't own process) |
 | `zcashd_compat_zcashd_restarts_after_exit` | resilience | SIGTERMs zcashd, waits for supervisor restart | **Skipped** (unix only; don't own process) |
 | `zcashd_compat_peer_connectivity` | network | **Skipped** (regtest has no peers) | Asserts at least one peer connected |
