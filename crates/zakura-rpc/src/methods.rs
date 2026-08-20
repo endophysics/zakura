@@ -40,6 +40,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(feature = "privacy-admission")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use chrono::Utc;
 use derive_getters::Getters;
 use derive_new::new;
@@ -169,9 +172,6 @@ pub(super) const PARAM_LIMIT_DESC: &str = "The maximum number of subtrees to ret
 pub(super) const PARAM_REQUEST_DESC: &str = "The request object containing the parameters.";
 pub(super) const PARAM_INDEX_DESC: &str = "The index of the subtree to return.";
 pub(super) const PARAM_RAW_TRANSACTION_HEX_DESC: &str = "The hex-encoded raw transaction bytes.";
-#[cfg(feature = "privacy-admission")]
-pub(super) const PARAM_ADMISSION_ID_DESC: &str =
-    "The caller-supplied private admission identifier.";
 #[allow(non_upper_case_globals)]
 pub(super) const PARAM__ALLOW_HIGH_FEES_DESC: &str = "Whether to allow high fees.";
 pub(super) const PARAM_NUM_BLOCKS_DESC: &str = "The number of blocks to return.";
@@ -842,12 +842,11 @@ pub trait Rpc {
 #[rpc(server)]
 /// Feature-gated private admission RPC method signatures.
 pub trait PrivateRpc {
-    /// Submits one raw transaction to the private admission pool.
+    /// Submits one raw transaction using a node-assigned private admission identity.
     #[method(name = "sendprivatetransaction")]
     async fn send_private_transaction(
         &self,
         raw_transaction_hex: String,
-        admission_id: mempool::AdmissionId,
     ) -> Result<mempool::PrivateAdmissionStatus>;
 
     /// Returns aggregate-only diagnostics for the private pool.
@@ -884,6 +883,9 @@ where
 
     /// The estimated last height this release supports, if enforced.
     end_of_support_height: Option<Height>,
+
+    #[cfg(feature = "privacy-admission")]
+    next_private_admission_id: Arc<AtomicU64>,
 
     // Services
     //
@@ -1000,6 +1002,8 @@ where
             network: network.clone(),
             debug_force_finished_sync,
             end_of_support_height: None,
+            #[cfg(feature = "privacy-admission")]
+            next_private_admission_id: Arc::new(AtomicU64::new(0)),
             mempool: mempool.clone(),
             state: state.clone(),
             read_state: read_state.clone(),
@@ -3360,9 +3364,21 @@ where
     async fn send_private_transaction(
         &self,
         raw_transaction_hex: String,
-        admission_id: mempool::AdmissionId,
     ) -> Result<mempool::PrivateAdmissionStatus> {
         let transaction = deserialize_raw_transaction(&raw_transaction_hex)?;
+        let admission_id = self
+            .next_private_admission_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map(mempool::AdmissionId)
+            .map_err(|_| {
+                ErrorObject::borrowed(
+                    ErrorCode::InternalError.code(),
+                    "private admission identity exhausted",
+                    None,
+                )
+            })?;
         let response = call_service(
             self.mempool.clone(),
             mempool::Request::QueuePrivate {
