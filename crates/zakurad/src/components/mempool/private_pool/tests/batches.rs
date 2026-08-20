@@ -61,8 +61,9 @@ fn remove_batch_is_all_or_nothing() {
 }
 
 #[test]
-fn duplicate_admission_ids_make_a_batch_invalid_without_removal() {
-    // Given: one retained record.
+fn duplicate_ids_from_an_internal_batch_caller_are_rejected_without_removal() {
+    // Given: one retained record and malformed input from an internal batch caller.
+    // The RPC adapter assigns IDs, and AdmissionCore uniquely keys them before batching.
     let transaction = transactions(1).pop().expect("transaction");
     let mut pool = PrivateVerifiedPool::new(config(1, LARGE_LIMIT));
     pool.insert(record(30, transaction)).expect("record fits");

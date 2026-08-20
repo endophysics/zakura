@@ -76,7 +76,7 @@ async fn private_pending_duplicate_preserves_first_admission_identity() -> Resul
     ) = setup(&network, u64::MAX, true).await;
     mempool.enable(&mut recent_syncs).await;
 
-    // When: the same transaction is submitted with the same and then a conflicting identity.
+    // When: the same transaction is submitted with the same and then a fresh internal identity.
     let first_response = mempool
         .ready()
         .await
@@ -97,7 +97,7 @@ async fn private_pending_duplicate_preserves_first_admission_identity() -> Resul
         })
         .await
         .expect("private duplicate returns a queue response");
-    let conflicting_response = mempool
+    let fresh_identity_response = mempool
         .ready()
         .await
         .expect("mempool service becomes ready")
@@ -107,7 +107,7 @@ async fn private_pending_duplicate_preserves_first_admission_identity() -> Resul
         })
         .await;
 
-    // Then: the first context remains canonical and duplicates report typed outcomes.
+    // Then: the first context remains canonical and both retries report Existing.
     assert!(matches!(
         first_response,
         Response::PrivateQueued {
@@ -127,8 +127,11 @@ async fn private_pending_duplicate_preserves_first_admission_identity() -> Resul
         }
     ));
     assert!(matches!(
-        conflicting_response.unbox_mempool_error(),
-        MempoolError::ConflictingPrivateAdmission
+        fresh_identity_response,
+        Ok(Response::PrivateQueued {
+            status: zakura_node_services::mempool::PrivateAdmissionStatus::Existing,
+            completion: None,
+        })
     ));
     assert_eq!(
         mempool

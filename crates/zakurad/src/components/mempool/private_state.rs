@@ -78,7 +78,7 @@ impl PrivateAdmissionState {
                 return Err(MempoolError::PrivateAdmissionIdConflict)
             }
             PrivatePoolMatch::TransactionConflict => {
-                return Err(MempoolError::ConflictingPrivateAdmission)
+                return Ok(PrivateReservationOutcome::Existing)
             }
             PrivatePoolMatch::Absent => {}
         }
@@ -91,7 +91,7 @@ impl PrivateAdmissionState {
             };
         }
         if self.admission_by_transaction.contains_key(&transaction_id) {
-            return Err(MempoolError::ConflictingPrivateAdmission);
+            return Ok(PrivateReservationOutcome::Existing);
         }
         if self
             .core

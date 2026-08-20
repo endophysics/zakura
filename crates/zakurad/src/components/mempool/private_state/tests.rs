@@ -44,7 +44,7 @@ fn retained_state() -> (PrivateAdmissionState, VerifiedUnminedTx, AdmissionConte
 
 #[test]
 fn active_exact_retry_remains_existing_without_mutation() {
-    // Given: one active reservation for a transaction and context.
+    // Given: one active reservation for a transaction and a fresh internal retry identity.
     let verified = Network::Mainnet
         .unmined_transactions_in_blocks(..)
         .next()
@@ -53,15 +53,19 @@ fn active_exact_retry_remains_existing_without_mutation() {
         admission_id: AdmissionId(700),
         policy: AdmissionPolicy::FixedEpoch,
     };
+    let retry_context = AdmissionContext {
+        admission_id: AdmissionId(701),
+        policy: AdmissionPolicy::FixedEpoch,
+    };
     let mut state = PrivateAdmissionState::new(PrivatePoolConfig::default());
     let first = state
         .reserve(verified.transaction.clone(), context)
         .expect("private capacity is available");
     let before = state.diagnostics();
 
-    // When: the same active transaction and context are retried.
+    // When: the same active transaction is retried with the next internal identity.
     let second = state
-        .reserve(verified.transaction, context)
+        .reserve(verified.transaction, retry_context)
         .expect("exact active retry is existing");
 
     // Then: no second reservation or ownership mutation is created.
@@ -69,6 +73,28 @@ fn active_exact_retry_remains_existing_without_mutation() {
     assert!(matches!(second, PrivateReservationOutcome::Existing));
     assert_eq!(state.diagnostics(), before);
     assert_eq!(state.reservations.len(), 1);
+}
+
+#[test]
+fn retained_exact_retry_with_a_fresh_internal_identity_remains_existing() {
+    // Given: one retained transaction and a fresh internal retry identity.
+    let (mut state, verified, context) = retained_state();
+    let retry_context = AdmissionContext {
+        admission_id: AdmissionId(context.admission_id.0 + 1),
+        policy: AdmissionPolicy::FixedEpoch,
+    };
+    let before = state.diagnostics();
+
+    // When: the retained transaction is retried with the next internal identity.
+    let result = state
+        .reserve(verified.transaction, retry_context)
+        .expect("exact retained retry is existing");
+
+    // Then: the original admission remains canonical and state is unchanged.
+    assert!(matches!(result, PrivateReservationOutcome::Existing));
+    assert_eq!(state.diagnostics(), before);
+    assert!(state.retained_record(context.admission_id).is_some());
+    assert!(state.retained_record(retry_context.admission_id).is_none());
 }
 
 fn due_state(count: usize) -> (PrivateAdmissionState, Vec<VerifiedUnminedTx>) {
