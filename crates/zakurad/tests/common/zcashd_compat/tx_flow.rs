@@ -2,6 +2,9 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+#[cfg(feature = "privacy-admission")]
+use std::sync::OnceLock;
+
 use color_eyre::eyre::{eyre, Result};
 use serde::Deserialize;
 use tokio::time::sleep;
@@ -23,7 +26,9 @@ use {
     zakura_node_services::mempool::{
         PrivateAdmissionStatus, PrivatePoolDiagnostics, SchedulerState,
     },
-    zakurad::components::mempool::private_pool::{PrivatePoolConfig, PrivateReleaseConfig},
+    zakurad::components::mempool::{
+        operator_policy::OperatorPrivacyPolicy, private_pool::PrivatePoolConfig,
+    },
 };
 
 use super::{
@@ -31,20 +36,20 @@ use super::{
     launch::{spawn_zakurad_with_zcashd_compat_config, ZcashdCompatSetup},
     setup_zcashd_compat, wait_for_zcashd_height, zakura_skip_zcashd_compat_tests,
 };
+#[cfg(feature = "privacy-admission")]
+use super::{
+    private_release::InspectionTiming,
+    private_release_transcript::{
+        completion_record, format_policy_records, format_timeline_record, p2p_observer_record,
+        MempoolCounts, PolicyRecord,
+    },
+};
 use crate::common::regtest::MiningRpcMethods;
 
 const OVERSIZED_TRANSACTION_LIMIT: u64 = 1;
 const OVERSIZED_REJECTION_METRIC: &str = "mempool_rejected_transactions_total";
 const PEER_MISBEHAVIOR_FLUSH_WAIT: Duration = Duration::from_secs(2);
 
-#[cfg(feature = "privacy-admission")]
-const PRIVATE_RELEASE_EPOCH: Duration = Duration::from_millis(250);
-#[cfg(feature = "privacy-admission")]
-const PRIVATE_MINIMUM_RELEASE_DELAY: Duration = Duration::from_secs(5);
-#[cfg(feature = "privacy-admission")]
-const PRIVATE_MAXIMUM_RELEASE_DELAY: Duration = Duration::from_secs(6);
-#[cfg(feature = "privacy-admission")]
-const PRIVATE_RETRY_DELAY: Duration = Duration::from_secs(3);
 #[cfg(feature = "privacy-admission")]
 const PRIVATE_MEMPOOL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(feature = "privacy-admission")]
@@ -150,20 +155,46 @@ pub async fn inspect_private_release() -> Result<()> {
         ));
     }
 
-    let release = PrivateReleaseConfig::new(
-        PRIVATE_RELEASE_EPOCH,
-        PRIVATE_MINIMUM_RELEASE_DELAY,
-        PRIVATE_MAXIMUM_RELEASE_DELAY,
-    )?;
-    let setup = spawn_zakurad_with_zcashd_compat_config(|config| {
-        config.mempool.private_pool = PrivatePoolConfig::new(10, 1_000_000, release)
-            .expect("inspection private-pool limits are nonzero");
+    let timing = InspectionTiming::from_env()?;
+    let captured_policy = Arc::new(OnceLock::new());
+    let spawn_policy = Arc::clone(&captured_policy);
+    let setup = spawn_zakurad_with_zcashd_compat_config(move |config| {
+        config.mempool.private_pool =
+            PrivatePoolConfig::new(10, 1_000_000, timing.release_config())
+                .expect("inspection private-pool limits are nonzero");
+        let policy = OperatorPrivacyPolicy::new(
+            config.mempool.private_pool,
+            config.network.max_connections_per_ip,
+            config.network.peerset_initial_target_size,
+        )
+        .expect("final inspection config fits the canonical policy representation");
+        spawn_policy
+            .set(policy)
+            .expect("the spawn config closure runs exactly once");
     })
     .await
     .map_err(|error| {
         eyre!("failed to start the managed Zakura and zcashd regtest nodes: {error}")
     })?;
-    println!("1. Started feature-enabled Zakura with one managed connected zcashd observer.");
+    let policy = *captured_policy
+        .get()
+        .expect("the completed spawn applied the inspection config closure");
+    let policy_hash = policy.hash().to_hex();
+    for record in format_policy_records(PolicyRecord {
+        version: policy.version(),
+        hash: &policy_hash,
+        release_timing: policy.release_timing(),
+        epoch: policy.release_epoch(),
+        minimum: policy.minimum_release_delay(),
+        maximum: policy.maximum_release_delay(),
+    }) {
+        println!("{record}");
+    }
+    let started_mempools = query_inspection_mempools(&setup).await?;
+    println!(
+        "{}",
+        format_timeline_record("managed_nodes_started", started_mempools.counts())
+    );
 
     setup.zakura_client.generate(110).await?;
     wait_for_zcashd_height(&setup.zcashd_client, 110).await?;
@@ -171,9 +202,6 @@ pub async fn inspect_private_release() -> Result<()> {
     let (raw_transaction, transaction_id) = signed_transparent_transaction(&setup)
         .await
         .map_err(|_| eyre!("failed to create the signed inspection transaction"))?;
-    println!(
-        "2. Mined spendable funds and signed a transparent transaction without broadcasting it."
-    );
 
     let private_params = serde_json::json!([&raw_transaction]).to_string();
     let accepted: PrivateAdmissionStatus = setup
@@ -186,6 +214,7 @@ pub async fn inspect_private_release() -> Result<()> {
         PrivateAdmissionStatus::Accepted,
         "first private submission must be accepted"
     );
+    let admission_completed = Instant::now();
     let admitted: PrivatePoolDiagnostics = setup
         .zakura_client
         .json_result_from_call("getprivatepoolinfo", "[]")
@@ -198,12 +227,15 @@ pub async fn inspect_private_release() -> Result<()> {
     assert_eq!(admitted.eligible_count, 0);
     assert_eq!(admitted.releasing_count, 0);
     assert_eq!(admitted.scheduler_state, SchedulerState::Running);
+    let admitted_mempools = query_inspection_mempools(&setup).await?;
+    assert_eq!(admitted_mempools.private, admitted);
+    admitted_mempools.assert_public_omits(&transaction_id);
     println!(
-        "3. Private admission returned Accepted; diagnostics expose no current-window details."
+        "{}",
+        format_timeline_record("private_admission_accepted", admitted_mempools.counts())
     );
 
-    sleep(PRIVATE_RETRY_DELAY).await;
-    let retry_started = Instant::now();
+    sleep(timing.retry_delay()).await;
     let existing: PrivateAdmissionStatus = setup
         .zakura_client
         .json_result_from_call("sendprivatetransaction", &private_params)
@@ -223,63 +255,113 @@ pub async fn inspect_private_release() -> Result<()> {
         after_retry, admitted,
         "exact retry must not change aggregate private state"
     );
-    assert_public_mempools_omit(&setup, &transaction_id).await?;
-    println!("4. Exact retry returned Existing; aggregate state and both public mempools stayed unchanged.");
+    let retry_mempools = query_inspection_mempools(&setup).await?;
+    assert_eq!(retry_mempools.private, after_retry);
+    retry_mempools.assert_public_omits(&transaction_id);
+    assert!(
+        Instant::now() < admission_completed + policy.minimum_release_delay(),
+        "the idempotent retry must complete before the configured minimum release delay"
+    );
+    println!(
+        "{}",
+        format_timeline_record("private_retry_existing", retry_mempools.counts())
+    );
 
     wait_for_zakura_mempool_tx_before(
         &setup,
         &transaction_id,
-        retry_started + PRIVATE_MINIMUM_RELEASE_DELAY,
+        admission_completed + policy.maximum_release_delay() + PRIVATE_MEMPOOL_POLL_INTERVAL,
     )
     .await?;
+    let zakura_release_mempools = query_inspection_mempools(&setup).await?;
+    assert!(zakura_release_mempools.zakura_contains(&transaction_id));
     println!(
-        "5. Zakura published the transaction inside its original release window, proving retry did not reset the deadline."
+        "{}",
+        format_timeline_record("zakura_public_release", zakura_release_mempools.counts())
     );
 
     wait_for_zcashd_mempool_tx(&setup, &transaction_id).await?;
-    println!(
-        "6. Connected zcashd observed normal P2P relay of public transaction {transaction_id}."
-    );
-
-    let released: PrivatePoolDiagnostics = setup
-        .zakura_client
-        .json_result_from_call("getprivatepoolinfo", "[]")
-        .await
-        .map_err(|error| eyre!("final private-pool diagnostics failed: {error}"))?;
+    let observer_release_mempools = query_inspection_mempools(&setup).await?;
+    assert!(observer_release_mempools.zakura_contains(&transaction_id));
+    assert!(observer_release_mempools.observer_contains(&transaction_id));
+    let released = &observer_release_mempools.private;
     assert_eq!(released.transaction_count, 0);
     assert_eq!(released.serialized_bytes, 0);
     assert_eq!(released.embargoed_count, 0);
     assert_eq!(released.eligible_count, 0);
     assert_eq!(released.releasing_count, 0);
-    println!("7. Final diagnostics remain aggregate-only after successful promotion.");
+    println!(
+        "{}",
+        format_timeline_record(
+            "observer_public_release",
+            observer_release_mempools.counts()
+        )
+    );
+    println!("{}", p2p_observer_record());
 
-    setup.teardown()
+    setup.teardown()?;
+    println!("{}", completion_record());
+    Ok(())
 }
 
 #[cfg(feature = "privacy-admission")]
-async fn assert_public_mempools_omit(
-    setup: &ZcashdCompatSetup,
-    transaction_id: &str,
-) -> Result<()> {
+#[derive(Debug, Eq, PartialEq)]
+struct InspectionMempools {
+    private: PrivatePoolDiagnostics,
+    zakura_public: Vec<String>,
+    observer_public: Vec<String>,
+}
+
+#[cfg(feature = "privacy-admission")]
+impl InspectionMempools {
+    fn counts(&self) -> MempoolCounts {
+        MempoolCounts {
+            private: self.private.transaction_count,
+            zakura_public: self.zakura_public.len(),
+            observer_public: self.observer_public.len(),
+        }
+    }
+
+    fn assert_public_omits(&self, transaction_id: &str) {
+        assert!(!self.zakura_contains(transaction_id));
+        assert!(!self.observer_contains(transaction_id));
+    }
+
+    fn zakura_contains(&self, transaction_id: &str) -> bool {
+        self.zakura_public
+            .iter()
+            .any(|entry| entry == transaction_id)
+    }
+
+    fn observer_contains(&self, transaction_id: &str) -> bool {
+        self.observer_public
+            .iter()
+            .any(|entry| entry == transaction_id)
+    }
+}
+
+#[cfg(feature = "privacy-admission")]
+async fn query_inspection_mempools(setup: &ZcashdCompatSetup) -> Result<InspectionMempools> {
+    let private: PrivatePoolDiagnostics = setup
+        .zakura_client
+        .json_result_from_call("getprivatepoolinfo", "[]")
+        .await
+        .map_err(|error| eyre!("private-pool diagnostics query failed: {error}"))?;
     let zakura_mempool: Vec<String> = setup
         .zakura_client
         .json_result_from_call("getrawmempool", "[]")
         .await
-        .map_err(|_| eyre!("Zakura public mempool query failed before release"))?;
+        .map_err(|error| eyre!("Zakura public mempool query failed: {error}"))?;
     let zcashd_mempool: Vec<String> = setup
         .zcashd_client
         .json_result_from_call("getrawmempool", "[]")
         .await
-        .map_err(|_| eyre!("zcashd public mempool query failed before release"))?;
-    assert!(
-        !zakura_mempool.iter().any(|entry| entry == transaction_id),
-        "private transaction must be absent from Zakura's public mempool before release"
-    );
-    assert!(
-        !zcashd_mempool.iter().any(|entry| entry == transaction_id),
-        "private transaction must be absent from zcashd's public mempool before release"
-    );
-    Ok(())
+        .map_err(|error| eyre!("zcashd public mempool query failed: {error}"))?;
+    Ok(InspectionMempools {
+        private,
+        zakura_public: zakura_mempool,
+        observer_public: zcashd_mempool,
+    })
 }
 
 #[cfg(feature = "privacy-admission")]
@@ -322,7 +404,7 @@ async fn wait_for_zcashd_mempool_tx(setup: &ZcashdCompatSetup, transaction_id: &
         }
     }
     Err(eyre!(
-        "public transaction {transaction_id} did not relay to zcashd within {ZCASHD_RELAY_POLL_ATTEMPTS} seconds"
+        "public release did not relay to zcashd within {ZCASHD_RELAY_POLL_ATTEMPTS} seconds"
     ))
 }
 

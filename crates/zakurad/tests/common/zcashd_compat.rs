@@ -16,6 +16,10 @@ pub mod chain;
 pub mod config;
 pub mod launch;
 pub mod network;
+#[cfg(feature = "privacy-admission")]
+pub mod private_release;
+#[cfg(feature = "privacy-admission")]
+pub mod private_release_transcript;
 pub mod reorg;
 pub mod resilience;
 pub mod startup;
