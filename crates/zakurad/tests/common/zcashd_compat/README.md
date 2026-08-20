@@ -33,6 +33,40 @@ In CI, the suite runs automatically on every merge to `main` that touches the
 zcashd-compat implementation or test harness — see
 [`.github/workflows/zcashd-compat-regtest.yml`](../../../../../.github/workflows/zcashd-compat-regtest.yml).
 
+### Private-release inspection
+
+On a host that supports the managed zcashd test setup, run the WP05 inspection
+with:
+
+```console
+just inspect-private-release
+```
+
+The inspection accepts three test-only timing overrides. Values are unsigned
+64-bit milliseconds; an unset or empty value selects the default.
+
+| Variable | Default | Constraint |
+|---|---:|---|
+| `TEST_ZCASHD_COMPAT_PRIVATE_RELEASE_EPOCH_MS` | 250 | Nonzero |
+| `TEST_ZCASHD_COMPAT_PRIVATE_RELEASE_MINIMUM_DELAY_MS` | 5000 | At least 2000 and no greater than the maximum |
+| `TEST_ZCASHD_COMPAT_PRIVATE_RELEASE_MAXIMUM_DELAY_MS` | 6000 | Nonzero and no less than the minimum |
+
+The 2000 ms inspection-only lower bound leaves at least half of the minimum
+delay for an idempotent retry before release. The retry delay is always derived
+as half of the validated minimum; there is no separate retry override. These
+variables affect only this acceptance path and do not configure a production
+zakurad process.
+
+Output is a stable, identifier-free transcript. `policy_*`, `release_timing`,
+and the seconds/nanoseconds duration records describe the exact finalized
+configuration used to start Zakura. Each `timeline_event` at a causal mempool
+stage reports counts from real `getprivatepoolinfo` and `getrawmempool` results.
+`p2p_observer_event=zcashd_observed_public_release` confirms the managed zcashd
+observer saw the public release over P2P, and
+`timeline_event=inspection_complete` is printed only after teardown succeeds.
+The transcript intentionally excludes transaction/admission identifiers, raw
+transactions, timestamps, and latency measurements.
+
 ### Reorg Stress Tests
 
 The regtest suite includes reorg regression coverage for zcashd's Zebra sync
@@ -144,6 +178,9 @@ error (misconfiguration, not a skip).
 | `TEST_ZCASHD_RPC_PASSWORD` | External (fallback) | zcashd RPC password |
 | `TEST_ZCASHD_COMPAT_REORG_ITERATIONS` | No | Reorg churn cycles; defaults to 30 in tests and 500 in `make compat-test-soak` |
 | `TEST_ZCASHD_COMPAT_RESTART_AFTER_REORG` | No | Set to `1` to run slow restart-after-reorg probes |
+| `TEST_ZCASHD_COMPAT_PRIVATE_RELEASE_EPOCH_MS` | No | Private-release inspection epoch in milliseconds; defaults to 250 |
+| `TEST_ZCASHD_COMPAT_PRIVATE_RELEASE_MINIMUM_DELAY_MS` | No | Private-release inspection minimum in milliseconds; defaults to 5000 |
+| `TEST_ZCASHD_COMPAT_PRIVATE_RELEASE_MAXIMUM_DELAY_MS` | No | Private-release inspection maximum in milliseconds; defaults to 6000 |
 
 ## Test Inventory
 
@@ -158,6 +195,7 @@ error (misconfiguration, not a skip).
 | `zcashd_compat_getwalletinfo_fields_present` | wallet | Full check | Full check |
 | `zcashd_compat_transparent_tx_in_mempool` | tx_flow | Mines 200, sends tx, polls zakurad mempool | Validates `getmempoolinfo` structure only |
 | `zcashd_compat_transparent_tx_confirms` | tx_flow | Sends + mines + checks confirmations on both sides | **Skipped** |
+| `zcashd_compat_inspect_private_release` | tx_flow | Managed identifier-free private-release inspection (`privacy-admission`) | **Skipped** |
 | `zcashd_compat_zakurad_clean_shutdown` | resilience | Mines 3, SIGKILLs zakurad, asserts clean exit | **Skipped** (don't own process) |
 | `zcashd_compat_zcashd_restarts_after_exit` | resilience | SIGTERMs zcashd, waits for supervisor restart | **Skipped** (unix only; don't own process) |
 | `zcashd_compat_peer_connectivity` | network | **Skipped** (regtest has no peers) | Asserts at least one peer connected |
@@ -205,6 +243,8 @@ crates/zakurad/tests/common/
     │                          read_test_network_kind()
     ├── launch.rs              ZcashdCompatSetup, spawn_zakurad_with_zcashd_compat(),
     │                          connect_to_external_zcashd_compat(), wait_for_zcashd_rpc()
+    ├── private_release.rs     test-only inspection timing parsing and validation
+    ├── private_release_transcript.rs stable inspection record formatting
     ├── startup.rs             both_processes_start, readiness_after_mine, sidecar_follows_tip, miner_rpcs_disabled
     ├── chain.rs               height_and_hash_agree, getblock_hash_consistent
     ├── wallet.rs              address_generation, initial_balance_zero,
