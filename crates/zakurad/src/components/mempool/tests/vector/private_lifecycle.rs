@@ -862,9 +862,7 @@ async fn promotion_terminally_expires_at_the_public_tip_boundary() -> Result<(),
             zakura_node_services::mempool::PrivatePromotionOutcome::Terminal { count: 1 }
         )
     ));
-    let diagnostics = harness.mempool.private_diagnostics();
-    assert_eq!(diagnostics.transaction_count, 0);
-    assert_eq!(diagnostics.terminal_count, 1);
+    assert_eq!(harness.mempool.private_diagnostics().transaction_count, 0);
     assert_eq!(harness.mempool.storage().transaction_count(), 0);
     assert_eq!(
         harness
@@ -1044,9 +1042,6 @@ async fn retained_grow_invalid_is_terminally_rejected() -> Result<(), Report> {
         .mempool
         .private_record(context.admission_id)
         .is_none());
-    let diagnostics = harness.mempool.private_diagnostics();
-    assert_eq!(diagnostics.terminal_count, 1);
-    assert_eq!(diagnostics.recoverable_count, 0);
     assert_eq!(harness.mempool.storage().transaction_count(), 0);
     assert!(matches!(
         harness.events.try_recv(),
@@ -1085,7 +1080,6 @@ async fn retained_grow_revalidation_is_independent_of_public_duplicate() -> Resu
         .is_some());
     assert_eq!(harness.mempool.tx_downloads().in_flight(), 1);
     assert_eq!(harness.mempool.private_tx_downloads().in_flight(), 1);
-    assert_eq!(harness.mempool.private_diagnostics().recoverable_count, 0);
     assert!(!harness
         .mempool
         .private_batch_available(context.admission_id));
@@ -1109,9 +1103,7 @@ async fn retained_mined_on_grow_is_removed_without_public_effects() -> Result<()
         .mempool
         .private_record(context.admission_id)
         .is_none());
-    let diagnostics = harness.mempool.private_diagnostics();
-    assert_eq!(diagnostics.transaction_count, 0);
-    assert_eq!(diagnostics.terminal_count, 1);
+    assert_eq!(harness.mempool.private_diagnostics().transaction_count, 0);
     assert_eq!(harness.mempool.storage().transaction_count(), 0);
     assert!(matches!(
         harness.events.try_recv(),

@@ -271,10 +271,7 @@ async fn closed_private_operations_are_rejected_while_mempool_is_disabled() -> R
             .await
             .expect("aggregate diagnostics remain available"),
         Response::PrivatePoolDiagnostics(diagnostics)
-            if diagnostics.transaction_count == 0
-                && diagnostics.promoted_count == 0
-                && diagnostics.recoverable_count == 0
-                && diagnostics.terminal_count == 0
+            if diagnostics.transaction_count == 0 && diagnostics.completed_window.is_none()
     ));
     Ok(())
 }

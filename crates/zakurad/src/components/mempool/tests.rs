@@ -99,7 +99,7 @@ impl Mempool {
     }
 
     #[cfg(feature = "privacy-admission")]
-    pub fn private_diagnostics(&self) -> zakura_node_services::mempool::PrivatePoolDiagnostics {
+    pub fn private_diagnostics(&mut self) -> zakura_node_services::mempool::PrivatePoolDiagnostics {
         self.private_admission.diagnostics()
     }
 
