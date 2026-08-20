@@ -12,6 +12,10 @@ use super::super::{RpcImpl, RpcServer};
 
 #[cfg(feature = "privacy-admission")]
 use super::super::PrivateRpcServer;
+#[cfg(feature = "privacy-admission")]
+use serde_json::json;
+#[cfg(feature = "privacy-admission")]
+use zakura_node_services::mempool::{PrivatePoolDiagnostics, PrivateWindowAggregate};
 
 #[cfg(feature = "privacy-admission")]
 mod enabled;
@@ -95,5 +99,75 @@ async fn private_rpc_registration_follows_feature_gate() {
     );
     assert!(names.contains(&"sendrawtransaction"));
     assert!(names.contains(&"getmempoolinfo"));
+    assert!(queue_task.now_or_never().is_none());
+}
+
+#[cfg(feature = "privacy-admission")]
+#[tokio::test]
+async fn json_rpc_boundary_preserves_aggregates_with_completed_window() {
+    // Given: a generated RPC module and one completed aggregate window.
+    let (mut mempool, rpc, queue_task) = test_rpc();
+    let mut methods = RpcServer::into_rpc(rpc.clone());
+    methods
+        .merge(PrivateRpcServer::into_rpc(rpc))
+        .expect("private RPC method names are unique");
+    let request = json!({
+        "jsonrpc": "2.0",
+        "method": "getprivatepoolinfo",
+        "params": [],
+        "id": 8
+    })
+    .to_string();
+    let diagnostics = PrivatePoolDiagnostics {
+        transaction_count: 4,
+        serialized_bytes: 5,
+        max_transactions: 6,
+        max_serialized_bytes: 7,
+        embargoed_count: 8,
+        eligible_count: 9,
+        releasing_count: 10,
+        scheduler_state: mempool::SchedulerState::Running,
+        completed_window: Some(PrivateWindowAggregate {
+            promoted: 3,
+            recoverable: 2,
+            terminal: 1,
+        }),
+    };
+
+    // When: JSON-RPC dispatches the aggregate diagnostics request.
+    let call = tokio::spawn(async move { methods.raw_json_request(&request, 1).await });
+    mempool
+        .expect_request(mempool::Request::PrivatePoolDiagnostics)
+        .await
+        .respond(mempool::Response::PrivatePoolDiagnostics(diagnostics));
+    let (response, _subscriptions) = call
+        .await
+        .expect("the RPC task does not panic")
+        .expect("the JSON-RPC request is valid");
+
+    // Then: the wire response preserves aggregate diagnostics without identity or timing fields.
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&response).expect("response is JSON"),
+        json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "transaction_count": 4,
+                "serialized_bytes": 5,
+                "max_transactions": 6,
+                "max_serialized_bytes": 7,
+                "embargoed_count": 8,
+                "eligible_count": 9,
+                "releasing_count": 10,
+                "scheduler_state": "running",
+                "completed_window": {
+                    "promoted": 3,
+                    "recoverable": 2,
+                    "terminal": 1
+                }
+            },
+            "id": 8
+        })
+    );
+    mempool.expect_no_requests().await;
     assert!(queue_task.now_or_never().is_none());
 }

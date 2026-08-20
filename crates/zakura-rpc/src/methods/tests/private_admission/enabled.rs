@@ -11,7 +11,7 @@ use zakura_chain::{
 };
 use zakura_node_services::mempool::{
     self, AdmissionContext, AdmissionId, AdmissionPolicy, PrivateAdmissionStatus,
-    PrivatePoolDiagnostics, SchedulerState,
+    PrivatePoolDiagnostics, PrivateWindowAggregate,
 };
 
 use super::{test_rpc, PrivateRpcServer, RpcServer};
@@ -211,10 +211,12 @@ async fn private_pool_info_maps_exact_aggregate_diagnostics() {
         embargoed_count: 5,
         eligible_count: 6,
         releasing_count: 7,
-        scheduler_state: SchedulerState::Stalled,
-        promoted_count: 8,
-        recoverable_count: 9,
-        terminal_count: 10,
+        scheduler_state: zakura_node_services::mempool::SchedulerState::Stalled,
+        completed_window: Some(PrivateWindowAggregate {
+            promoted: 8,
+            recoverable: 9,
+            terminal: 10,
+        }),
     };
     let call = tokio::spawn(async move { rpc.get_private_pool_info().await });
     mempool
@@ -241,9 +243,11 @@ async fn private_pool_info_maps_exact_aggregate_diagnostics() {
             "eligible_count": 6,
             "releasing_count": 7,
             "scheduler_state": "stalled",
-            "promoted_count": 8,
-            "recoverable_count": 9,
-            "terminal_count": 10
+            "completed_window": {
+                "promoted": 8,
+                "recoverable": 9,
+                "terminal": 10
+            }
         })
     );
     mempool.expect_no_requests().await;
