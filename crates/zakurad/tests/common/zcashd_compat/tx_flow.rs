@@ -191,6 +191,7 @@ pub async fn inspect_private_release() -> Result<()> {
         .json_result_from_call("getprivatepoolinfo", "[]")
         .await
         .map_err(|_| eyre!("private-pool diagnostics failed after admission"))?;
+    assert!(admitted.completed_window.is_none());
     assert_eq!(admitted.transaction_count, 1);
     assert!(admitted.serialized_bytes > 0);
     assert_eq!(admitted.embargoed_count, 1);
@@ -198,7 +199,7 @@ pub async fn inspect_private_release() -> Result<()> {
     assert_eq!(admitted.releasing_count, 0);
     assert_eq!(admitted.scheduler_state, SchedulerState::Running);
     println!(
-        "3. Private admission returned Accepted; aggregate diagnostics show one embargoed transaction."
+        "3. Private admission returned Accepted; diagnostics expose no current-window details."
     );
 
     sleep(PRIVATE_RETRY_DELAY).await;
@@ -250,8 +251,7 @@ pub async fn inspect_private_release() -> Result<()> {
     assert_eq!(released.embargoed_count, 0);
     assert_eq!(released.eligible_count, 0);
     assert_eq!(released.releasing_count, 0);
-    assert_eq!(released.promoted_count, admitted.promoted_count + 1);
-    println!("7. Final diagnostics show zero private transactions and one successful promotion.");
+    println!("7. Final diagnostics remain aggregate-only after successful promotion.");
 
     setup.teardown()
 }
