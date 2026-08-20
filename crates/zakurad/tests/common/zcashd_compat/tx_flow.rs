@@ -21,7 +21,7 @@ use zakura_test::net::random_known_port;
 use {
     tokio::time::Instant,
     zakura_node_services::mempool::{
-        AdmissionId, PrivateAdmissionStatus, PrivatePoolDiagnostics, SchedulerState,
+        PrivateAdmissionStatus, PrivatePoolDiagnostics, SchedulerState,
     },
     zakurad::components::mempool::private_pool::{PrivatePoolConfig, PrivateReleaseConfig},
 };
@@ -175,8 +175,7 @@ pub async fn inspect_private_release() -> Result<()> {
         "2. Mined spendable funds and signed a transparent transaction without broadcasting it."
     );
 
-    let admission_id = AdmissionId(1);
-    let private_params = serde_json::json!([&raw_transaction, admission_id]).to_string();
+    let private_params = serde_json::json!([&raw_transaction]).to_string();
     let accepted: PrivateAdmissionStatus = setup
         .zakura_client
         .json_result_from_call("sendprivatetransaction", &private_params)
