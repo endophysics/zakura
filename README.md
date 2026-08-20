@@ -139,6 +139,9 @@ The Zakura maintainers provide the following resources:
 - The [documentation of the internal APIs](https://zakura-core.github.io/zakura/internal)
   for the `main` branch of the whole Zakura monorepo.
 
+- The [private admission operator guide](docs/privacy-admission.md) for policy
+  inspection, aggregate telemetry, restart behavior, and compile-time rollback.
+
 ## User support
 
 If Zakura doesn't behave the way you expected, [open an
