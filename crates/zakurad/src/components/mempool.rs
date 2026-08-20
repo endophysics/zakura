@@ -62,6 +62,8 @@ mod crawler;
 pub mod downloads;
 mod error;
 pub mod gossip;
+#[cfg(feature = "privacy-admission")]
+pub mod operator_policy;
 mod pending_outputs;
 #[cfg(feature = "privacy-admission")]
 pub mod private_pool;
@@ -1643,7 +1645,7 @@ impl Service<Request> for Mempool {
                     #[cfg(feature = "privacy-admission")]
                     Request::PromotePrivateDue => Response::PrivatePromoted(
                         zakura_node_services::mempool::PrivatePromotionOutcome::Recoverable {
-                            count: self.private_admission.diagnostics().transaction_count,
+                            count: self.private_admission.retained_count(),
                         },
                     ),
 

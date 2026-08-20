@@ -43,6 +43,18 @@ pub enum SchedulerState {
     Stalled,
 }
 
+/// Aggregate outcomes from one completed private telemetry window.
+#[cfg_attr(feature = "rpc-client", derive(serde::Deserialize, serde::Serialize))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PrivateWindowAggregate {
+    /// Number of promoted transactions.
+    pub promoted: u64,
+    /// Number of recoverable outcomes.
+    pub recoverable: u64,
+    /// Number of terminal outcomes.
+    pub terminal: u64,
+}
+
 /// Aggregate-only private-pool diagnostics.
 #[cfg_attr(feature = "rpc-client", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,12 +75,8 @@ pub struct PrivatePoolDiagnostics {
     pub releasing_count: usize,
     /// Aggregate scheduler health.
     pub scheduler_state: SchedulerState,
-    /// Total promoted transactions.
-    pub promoted_count: usize,
-    /// Total recoverable promotion outcomes.
-    pub recoverable_count: usize,
-    /// Total terminal promotion outcomes.
-    pub terminal_count: usize,
+    /// Outcomes from the most recently completed fixed release-epoch window.
+    pub completed_window: Option<PrivateWindowAggregate>,
 }
 
 /// Aggregate result of one private promotion attempt.

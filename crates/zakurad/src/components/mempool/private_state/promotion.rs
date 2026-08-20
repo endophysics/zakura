@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use zakura_chain::transaction::UnminedTxId;
 use zakura_node_services::mempool::{AdmissionId, PrivatePromotionOutcome};
 
-use super::{lifecycle::TerminalDecision, PrivateAdmissionState};
+use super::{lifecycle::TerminalDecision, PrivateAdmissionState, PrivateTelemetryOutcome};
 use crate::components::mempool::{
     storage::{
         AtomicBatchInsertError, ExactTipRejectionError, SameEffectsChainRejectionError,
@@ -78,7 +78,7 @@ impl PrivateAdmissionState {
             Err(_) => {
                 let count = self.pool.stats().transaction_count;
                 self.core = core_before;
-                self.recoverable_count += count;
+                self.record_telemetry(PrivateTelemetryOutcome::Recoverable, count);
                 return PrivatePromotionEffects::without_public_effects(
                     PrivatePromotionOutcome::Recoverable { count },
                 );
@@ -91,7 +91,7 @@ impl PrivateAdmissionState {
             .any(|admission_id| excluded.contains(admission_id))
         {
             self.core = core_before;
-            self.recoverable_count += count;
+            self.record_telemetry(PrivateTelemetryOutcome::Recoverable, count);
             return PrivatePromotionEffects::without_public_effects(
                 PrivatePromotionOutcome::Recoverable { count },
             );
@@ -100,7 +100,7 @@ impl PrivateAdmissionState {
             Ok(batch) => batch,
             Err(_) => {
                 self.core = core_before;
-                self.recoverable_count += count;
+                self.record_telemetry(PrivateTelemetryOutcome::Recoverable, count);
                 return PrivatePromotionEffects::without_public_effects(
                     PrivatePromotionOutcome::Recoverable { count },
                 );
@@ -109,7 +109,7 @@ impl PrivateAdmissionState {
         let mut committed_core = self.core.clone();
         if committed_core.commit_release(prepared).is_err() {
             self.core = core_before;
-            self.recoverable_count += count;
+            self.record_telemetry(PrivateTelemetryOutcome::Recoverable, count);
             return PrivatePromotionEffects::without_public_effects(
                 PrivatePromotionOutcome::Recoverable { count },
             );
@@ -122,7 +122,7 @@ impl PrivateAdmissionState {
             }) => {
                 self.core = core_before;
                 let Some(decision) = candidate_terminal_decision(&source) else {
-                    self.recoverable_count += count;
+                    self.record_telemetry(PrivateTelemetryOutcome::Recoverable, count);
                     return PrivatePromotionEffects::without_public_effects(
                         PrivatePromotionOutcome::Recoverable { count },
                     );
@@ -130,7 +130,7 @@ impl PrivateAdmissionState {
                 let terminal_count = match self.terminalize(&[(admission_id, decision)]) {
                     Ok(terminal_count) => terminal_count,
                     Err(_) => {
-                        self.recoverable_count += count;
+                        self.record_telemetry(PrivateTelemetryOutcome::Recoverable, count);
                         return PrivatePromotionEffects::without_public_effects(
                             PrivatePromotionOutcome::Recoverable { count },
                         );
@@ -151,7 +151,7 @@ impl PrivateAdmissionState {
                 let terminal_count = match self.terminalize(&decisions) {
                     Ok(terminal_count) => terminal_count,
                     Err(_) => {
-                        self.recoverable_count += count;
+                        self.record_telemetry(PrivateTelemetryOutcome::Recoverable, count);
                         return PrivatePromotionEffects::without_public_effects(
                             PrivatePromotionOutcome::Recoverable { count },
                         );
@@ -165,7 +165,7 @@ impl PrivateAdmissionState {
             }
             Err(AtomicBatchInsertError::EvictionInvariant) => {
                 self.core = core_before;
-                self.recoverable_count += count;
+                self.record_telemetry(PrivateTelemetryOutcome::Recoverable, count);
                 return PrivatePromotionEffects::without_public_effects(
                     PrivatePromotionOutcome::Recoverable { count },
                 );
@@ -173,7 +173,7 @@ impl PrivateAdmissionState {
         };
         self.core = committed_core;
         self.pool.remove_validated_batch(batch);
-        self.promoted_count += count;
+        self.record_telemetry(PrivateTelemetryOutcome::Promoted, count);
         self.publish_release_deadline();
         PrivatePromotionEffects {
             outcome: PrivatePromotionOutcome::Promoted { count },

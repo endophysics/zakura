@@ -168,7 +168,6 @@ fn deterministic_retained_failures_terminalize_the_record() {
             admission.reason.as_ref().map(|reason| reason.as_str()),
             Some(expected_reason)
         );
-        assert_eq!(state.diagnostics().terminal_count, 1);
     }
 }
 
@@ -189,7 +188,6 @@ fn expiry_is_inclusive_and_selectively_terminal() {
     assert_eq!(removed, 1);
     assert!(state.retained_record(AdmissionId(0)).is_none());
     assert!(state.retained_record(AdmissionId(1)).is_some());
-    assert_eq!(state.diagnostics().terminal_count, 1);
 }
 
 #[test]
@@ -246,5 +244,4 @@ fn multi_record_terminal_staging_is_all_or_nothing() {
     assert_eq!(state.core.snapshot(), core_before);
     assert!(state.retained_record(AdmissionId(0)).is_some());
     assert!(state.retained_record(AdmissionId(1)).is_some());
-    assert_eq!(state.diagnostics().terminal_count, 0);
 }

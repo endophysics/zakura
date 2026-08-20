@@ -7,7 +7,7 @@ use zakura_chain::{
 };
 use zakura_node_services::mempool::{AdmissionContext, AdmissionId};
 
-use super::PrivateAdmissionState;
+use super::{PrivateAdmissionState, PrivateTelemetryOutcome};
 use crate::components::mempool::{
     downloads::TransactionDownloadVerifyError,
     private_pool::{PrivateBatch, PrivatePoolError, PrivatePoolMatch, PrivateRecord},
@@ -84,7 +84,7 @@ impl PrivateAdmissionState {
             )
         {
             self.revalidating.remove(&context.admission_id);
-            self.recoverable_count += 1;
+            self.record_telemetry(PrivateTelemetryOutcome::Recoverable, 1);
         }
     }
 
@@ -156,7 +156,7 @@ impl PrivateAdmissionState {
         for admission_id in admission_ids {
             self.revalidating.remove(&admission_id);
         }
-        self.terminal_count += decisions.len();
+        self.record_telemetry(PrivateTelemetryOutcome::Terminal, decisions.len());
         self.publish_release_deadline();
         Ok(decisions.len())
     }

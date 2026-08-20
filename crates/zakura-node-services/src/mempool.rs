@@ -23,7 +23,7 @@ mod transaction_dependencies;
 #[cfg(feature = "privacy-admission")]
 pub use self::private::{
     AdmissionContext, AdmissionId, AdmissionPolicy, PrivateAdmissionStatus, PrivatePoolDiagnostics,
-    PrivatePromotionOutcome, SchedulerState,
+    PrivatePromotionOutcome, PrivateWindowAggregate, SchedulerState,
 };
 pub use self::{
     gossip::Gossip,
@@ -54,7 +54,7 @@ mod tests {
         PrivatePromotionOutcome, Request, Response,
     };
     #[cfg(all(feature = "privacy-admission", feature = "rpc-client"))]
-    use super::{PrivatePoolDiagnostics, SchedulerState};
+    use super::{PrivatePoolDiagnostics, PrivateWindowAggregate, SchedulerState};
     #[cfg(feature = "privacy-admission")]
     use zakura_chain::transaction::UnminedTx;
 
@@ -110,9 +110,11 @@ mod tests {
             eligible_count: 1,
             releasing_count: 1,
             scheduler_state: SchedulerState::Idle,
-            promoted_count: 7,
-            recoverable_count: 2,
-            terminal_count: 1,
+            completed_window: Some(PrivateWindowAggregate {
+                promoted: 7,
+                recoverable: 2,
+                terminal: 1,
+            }),
         };
         let outcome = PrivatePromotionOutcome::Promoted { count: 3 };
 
@@ -126,6 +128,24 @@ mod tests {
         let serialized = serde_json::to_string(&(status, diagnostics, outcome, scheduler_states))
             .expect("aggregate contracts serialize");
         let debug = format!("{status:?} {diagnostics:?} {outcome:?}");
+        assert_eq!(
+            serde_json::to_value(diagnostics).expect("diagnostics serialize"),
+            serde_json::json!({
+                "transaction_count": 3,
+                "serialized_bytes": 4096,
+                "max_transactions": 10,
+                "max_serialized_bytes": 8192,
+                "embargoed_count": 1,
+                "eligible_count": 1,
+                "releasing_count": 1,
+                "scheduler_state": "idle",
+                "completed_window": {
+                    "promoted": 7,
+                    "recoverable": 2,
+                    "terminal": 1
+                }
+            })
+        );
 
         // Then: only aggregate, non-sensitive fields are exposed.
         for forbidden in [
@@ -137,6 +157,10 @@ mod tests {
             "accepted_at",
             "scheduled_release_at",
             "terminal_at",
+            "window_start",
+            "window_end",
+            "window_id",
+            "latency",
         ] {
             assert!(
                 !serialized.contains(forbidden),
@@ -146,13 +170,48 @@ mod tests {
         }
         assert!(serialized.contains("transaction_count"));
         assert!(serialized.contains("serialized_bytes"));
+        assert!(serialized.contains("max_transactions"));
+        assert!(serialized.contains("max_serialized_bytes"));
+        assert!(serialized.contains("embargoed_count"));
+        assert!(serialized.contains("eligible_count"));
+        assert!(serialized.contains("releasing_count"));
         assert!(serialized.contains("\"scheduler_state\":\"idle\""));
         assert!(serialized.contains("\"running\""));
         assert!(serialized.contains("\"stopping\""));
         assert!(serialized.contains("\"stalled\""));
-        assert!(serialized.contains("promoted_count"));
-        assert!(serialized.contains("recoverable_count"));
-        assert!(serialized.contains("terminal_count"));
+        assert!(serialized.contains("completed_window"));
+        assert!(serialized.contains("promoted"));
+        assert!(serialized.contains("recoverable"));
+        assert!(serialized.contains("terminal"));
+        assert!(!serialized.contains("promoted_count"));
+        assert!(!serialized.contains("recoverable_count"));
+        assert!(!serialized.contains("terminal_count"));
+
+        let empty = PrivatePoolDiagnostics {
+            transaction_count: 0,
+            serialized_bytes: 0,
+            max_transactions: 10,
+            max_serialized_bytes: 8192,
+            embargoed_count: 0,
+            eligible_count: 0,
+            releasing_count: 0,
+            scheduler_state: SchedulerState::Idle,
+            completed_window: None,
+        };
+        assert_eq!(
+            serde_json::to_value(empty).expect("empty diagnostics serialize"),
+            serde_json::json!({
+                "transaction_count": 0,
+                "serialized_bytes": 0,
+                "max_transactions": 10,
+                "max_serialized_bytes": 8192,
+                "embargoed_count": 0,
+                "eligible_count": 0,
+                "releasing_count": 0,
+                "scheduler_state": "idle",
+                "completed_window": null
+            })
+        );
     }
 
     #[cfg(feature = "privacy-admission")]

@@ -49,7 +49,6 @@ fn retained_verifier_failure_is_recoverable_without_removal() {
             .verification_tip(),
         original_tip
     );
-    assert_eq!(state.diagnostics().recoverable_count, 1);
     assert!(state.snapshot_batch(&[context.admission_id]).is_ok());
 }
 

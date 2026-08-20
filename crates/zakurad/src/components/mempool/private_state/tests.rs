@@ -43,6 +43,13 @@ fn retained_state() -> (PrivateAdmissionState, VerifiedUnminedTx, AdmissionConte
 }
 
 #[test]
+fn initial_diagnostics_have_no_completed_window() {
+    let mut state = PrivateAdmissionState::new(PrivatePoolConfig::default());
+
+    assert_eq!(state.diagnostics().completed_window, None);
+}
+
+#[test]
 fn active_exact_retry_remains_existing_without_mutation() {
     // Given: one active reservation for a transaction and a fresh internal retry identity.
     let verified = Network::Mainnet
@@ -202,7 +209,6 @@ fn promotion_commits_the_complete_due_batch_in_deterministic_order() {
     assert!(effects.evicted.is_empty());
     assert_eq!(storage.tx_ids().collect::<HashSet<_>>(), expected_ids);
     assert_eq!(state.diagnostics().transaction_count, 0);
-    assert_eq!(state.diagnostics().promoted_count, 3);
     assert!(state
         .core
         .snapshot()
@@ -232,7 +238,6 @@ fn revalidating_due_batch_is_recoverable_and_preserved() {
     assert!(effects.evicted.is_empty());
     assert_eq!(state.core.snapshot(), before_core);
     assert_eq!(state.diagnostics().transaction_count, 2);
-    assert_eq!(state.diagnostics().recoverable_count, 2);
     assert_eq!(storage.transaction_count(), 0);
     assert!(transactions.iter().enumerate().all(|(index, _)| state
         .retained_record(AdmissionId(u64::try_from(index).expect("test index fits")))
@@ -264,7 +269,6 @@ fn terminal_public_conflict_removes_only_the_candidate_and_allows_fresh_promotio
     assert!(state.retained_record(AdmissionId(1)).is_some());
     assert_eq!(state.schedule(AdmissionId(1)), unaffected_schedule);
     assert_eq!(state.diagnostics().transaction_count, 1);
-    assert_eq!(state.diagnostics().terminal_count, 1);
     assert_eq!(storage.tx_ids().collect::<HashSet<_>>(), public_before);
 
     // When: a fresh complete preparation runs after selective terminal removal.
@@ -310,7 +314,6 @@ fn mined_grow_terminally_removes_private_record() {
 
     // Then: the pool releases ownership only after the core records removal.
     assert!(state.retained_record(context.admission_id).is_none());
-    assert_eq!(state.diagnostics().terminal_count, 1);
     assert_eq!(
         state.core.snapshot().admissions[0].state,
         AdmissionStateLabel::Removed

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use privacy_admission_core::{
-    AdmissionCore, AdmissionOrigin as CoreOrigin, AdmissionOutcome, AdmissionStateLabel,
+    AdmissionCore, AdmissionOrigin as CoreOrigin, AdmissionOutcome, AdmissionStateLabel, Clock,
     MonotonicClock, Timestamp,
 };
 use tokio::sync::{oneshot, watch};
@@ -23,7 +23,10 @@ use super::{
 };
 
 mod lifecycle;
+mod private_telemetry;
 mod promotion;
+
+use private_telemetry::{PrivateTelemetry, PrivateTelemetryOutcome};
 
 struct Reservation {
     transaction: UnminedTx,
@@ -42,16 +45,16 @@ pub(super) struct PrivateAdmissionState {
     config: PrivatePoolConfig,
     release_deadlines: watch::Sender<Option<Timestamp>>,
     scheduler_state: watch::Receiver<SchedulerState>,
-    promoted_count: usize,
-    recoverable_count: usize,
-    terminal_count: usize,
+    telemetry: PrivateTelemetry,
 }
 
 impl PrivateAdmissionState {
     pub(super) fn new(config: PrivatePoolConfig) -> Self {
         let (release_deadlines, _) = watch::channel(None);
+        let clock = MonotonicClock::new();
+        let telemetry = PrivateTelemetry::new(clock.now(), config.release_epoch());
         Self {
-            core: AdmissionCore::new(MonotonicClock::new(), config.release_policy()),
+            core: AdmissionCore::new(clock, config.release_policy()),
             pool: PrivateVerifiedPool::new(config),
             reservations: BTreeMap::new(),
             revalidating: HashSet::new(),
@@ -60,9 +63,7 @@ impl PrivateAdmissionState {
             config,
             release_deadlines,
             scheduler_state: watch::channel(SchedulerState::Idle).1,
-            promoted_count: 0,
-            recoverable_count: 0,
-            terminal_count: 0,
+            telemetry,
         }
     }
 
@@ -160,7 +161,7 @@ impl PrivateAdmissionState {
             let result = self.pool.replace(replacement);
             self.revalidating.remove(&context.admission_id);
             if result.is_err() {
-                self.recoverable_count += 1;
+                self.record_telemetry(PrivateTelemetryOutcome::Recoverable, 1);
             }
             return;
         }
@@ -228,7 +229,7 @@ impl PrivateAdmissionState {
                 }
             }
             self.revalidating.remove(&context.admission_id);
-            self.recoverable_count += 1;
+            self.record_telemetry(PrivateTelemetryOutcome::Recoverable, 1);
             return;
         }
 
@@ -247,7 +248,7 @@ impl PrivateAdmissionState {
             )
         {
             self.revalidating.remove(&context.admission_id);
-            self.recoverable_count += 1;
+            self.record_telemetry(PrivateTelemetryOutcome::Recoverable, 1);
             return;
         }
         self.fail_reservation(transaction_id, context);
@@ -279,9 +280,10 @@ impl PrivateAdmissionState {
         }
     }
 
-    pub(super) fn diagnostics(&self) -> PrivatePoolDiagnostics {
+    pub(super) fn diagnostics(&mut self) -> PrivatePoolDiagnostics {
         let stats = self.pool.stats();
         let snapshot = self.core.snapshot();
+        let completed_window = self.telemetry.completed_window(self.core.clock().now());
         PrivatePoolDiagnostics {
             transaction_count: stats.transaction_count,
             serialized_bytes: stats.serialized_bytes,
@@ -302,10 +304,12 @@ impl PrivateAdmissionState {
                 .count(),
             releasing_count: 0,
             scheduler_state: *self.scheduler_state.borrow(),
-            promoted_count: self.promoted_count,
-            recoverable_count: self.recoverable_count,
-            terminal_count: self.terminal_count,
+            completed_window,
         }
+    }
+
+    pub(super) fn retained_count(&self) -> usize {
+        self.pool.stats().transaction_count
     }
 
     pub(super) fn set_scheduler_state(&mut self, state: watch::Receiver<SchedulerState>) {
@@ -340,6 +344,12 @@ impl PrivateAdmissionState {
     fn publish_release_deadline(&self) {
         self.release_deadlines
             .send_replace(self.core.earliest_release_at());
+    }
+
+    fn record_telemetry(&mut self, outcome: PrivateTelemetryOutcome, count: usize) {
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        self.telemetry
+            .record(self.core.clock().now(), outcome, count);
     }
 }
 
