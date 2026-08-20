@@ -3,7 +3,10 @@
 Private admission is available only in a `zakurad` binary compiled with the
 `privacy-admission` feature. It keeps verified private submissions in a bounded,
 volatile pool and releases them on fixed release epochs. Outside isolated regtest,
-the RPC listener must use cookie authentication.
+the RPC listener must use cookie authentication. This prevents unauthenticated
+clients from submitting transactions to the private pool or reading its aggregate
+diagnostics. Zakura generates a fresh credential at startup, stores it in an
+owner-only file, and removes it on shutdown.
 
 ## Startup Records
 
