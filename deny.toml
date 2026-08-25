@@ -124,7 +124,7 @@ skip-tree = [
     { name = "sha2", version = "=0.10.9" },
     { name = "ripemd", version = "=0.1.3" },
 
-    # pre-release RustCrypto crates pulled in by librustzcash 2026-04 release wave;
+    # pre-release RustCrypto crates pulled in by the April 2026 librustzcash release;
     # remove once the broader ecosystem catches up to the same pre-release line
     { name = "block-buffer", version = "=0.11.0-rc.3" },
     { name = "crypto-common", version = "=0.2.0-rc.1" },
