@@ -244,7 +244,7 @@ crates/zakurad/tests/common/
     ├── launch.rs              ZcashdCompatSetup, spawn_zakurad_with_zcashd_compat(),
     │                          connect_to_external_zcashd_compat(), wait_for_zcashd_rpc()
     ├── private_release.rs     test-only inspection timing parsing and validation
-    ├── private_release_inspection.rs managed WP05 release inspection orchestration
+    ├── private_release_inspection.rs managed release inspection orchestration
     ├── private_release_transcript.rs stable inspection record formatting
     ├── startup.rs             both_processes_start, readiness_after_mine, sidecar_follows_tip, miner_rpcs_disabled
     ├── chain.rs               height_and_hash_agree, getblock_hash_consistent
